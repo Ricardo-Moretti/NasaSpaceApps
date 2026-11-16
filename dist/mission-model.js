@@ -33,7 +33,15 @@ const PHASE_TABLE = [
 ];
 export const ANIMATION_SECONDS=PHASE_TABLE.reduce((sum,p)=>sum+p[2],0);
 export const PHASES = PHASE_TABLE.map(([id,label,seconds],i,all)=>{const before=all.slice(0,i).reduce((sum,p)=>sum+p[2],0);return {id,label,seconds,start:before/ANIMATION_SECONDS,end:(before+seconds)/ANIMATION_SECONDS};});
-export const LOCAL_DESCENT_START=.25,LOCAL_ASCENT_END=.70,DOCK_END=.4;
+export const LOCAL_DESCENT_START=.25,LOCAL_ASCENT_END=.70;
+// Rendezvous after the lunar liftoff, on Apollo 11's timeline (GET): liftoff 124:22, docking 128:03, ascent stage
+// jettison 130:10, trans-Earth injection 135:24. The fractions are of the return lunar orbit stage, whose clock runs
+// from the orbit insertion to the injection. The ascent stage reaches orbit behind and below the CSM, as in the
+// coelliptic rendezvous flown from Apollo 11 on, and closes on it: the CSM is in the picture from the climb on.
+export const RENDEZVOUS=Object.freeze({behindKm:70,belowKm:22,contact:.35,capture:.38,jettison:.56,separated:.64,turned:.8});
+// Docking interface of NASA's models (nasa-models.js): the LM drogue 2.75 m above the ascent stage's base, the CSM
+// probe tip 2.58 m ahead of the command module's base. Docked, the two origins are 5.33 m apart.
+export const LM_PORT_KM=.00275,CSM_PROBE_KM=.0025786,DOCKED_KM=LM_PORT_KM+CSM_PROBE_KM;
 const TAU = 2*Math.PI;
 const add = (a,b) => a.map((v,i)=>v+b[i]);
 const subtract = (a,b) => a.map((v,i)=>v-b[i]);
@@ -44,6 +52,13 @@ const unit = a => scale(a,1/norm(a));
 const mix = (a,b,t) => a+(b-a)*t;
 const cross = (a,b) => [a[1]*b[2]-a[2]*b[1],a[2]*b[0]-a[0]*b[2],a[0]*b[1]-a[1]*b[0]];
 const smooth = t => t*t*(3-2*t);
+const ramp = (a,b,x) => smooth(Math.min(1,Math.max(0,(x-a)/(b-a))));
+// Great-circle interpolation of unit vectors.
+function slerp(a,b,t){
+  const c=clamp(dot(a,b),-1,1),w=Math.acos(c);
+  if(w<1e-6)return unit(add(scale(a,1-t),scale(b,t)));
+  return add(scale(a,Math.sin((1-t)*w)/Math.sin(w)),scale(b,Math.sin(t*w)/Math.sin(w)));
+}
 // Ease only the presentation clock over the outer 8% of a stage. Analytic
 // parking motion still has the correct speed/period as a function of UTC.
 export function presentationTime(t){
@@ -111,10 +126,56 @@ export function parkingState(orbit,ms,radiusKm=orbit.radiusKm){
 export function parkingPath(orbit){
   return Array.from({length:193},(_,i)=>scale(rotate(orbit.p,orbit.q,TAU*i/192),orbit.radiusKm));
 }
-function lunarArc(plan,ms,t,ascending,astronomy){
+// The CSM's local frame on a circular orbit: x along the motion, y across (the orbit normal), z up from the centre.
+function localFrame(orbit,ms){
+  const s=parkingState(orbit,ms),z=unit(s.relative),x=s.direction;
+  return {x,y:cross(z,x),z,relative:s.relative};
+}
+const toLocal=(f,v)=>[dot(v,f.x),dot(v,f.y),dot(v,f.z)];
+const fromLocal=(f,c)=>add(add(scale(f.x,c[0]),scale(f.y,c[1])),scale(f.z,c[2]));
+// Final approach from the insertion (k = 0) to contact (k = 1). The gap between the docking ports falls geometrically
+// to 30 m, so the CSM grows in the picture at a steady rate, as through the LM's window; the last 30 m are flown slowly,
+// with a metre of offset across the docking axis taken out before contact. The line of sight turns from below and
+// behind the CSM to straight behind it. RCS bursts brake the closing speed at the range gates.
+function approach(R,k){
+  const g0=R.range0-DOCKED_KM,k1=.82,g1=.03;
+  const gap=k<k1?g0*Math.pow(g1/g0,k/k1):g1*Math.pow(1-(k-k1)/(1-k1),1.5);
+  const u=slerp(R.u0,[1,0,0],ramp(.04,.8,k)),across=.0012*ramp(.55,.75,k)*(1-ramp(.85,.97,k));
+  const rcs=gap<=0?0:Math.max(...[1.5,.45,.12,.03,.01,.003].map(g=>Math.exp(-(((Math.log(gap)-Math.log(g))/.12)**2))));
+  return {gap,u,across,rcs};
+}
+// Both spacecraft from the orbit insertion to the trans-Earth injection, on the CSM's orbit point `at` (the stage clock
+// at fraction t). Positions are absolute (km, like every sample position); focus runs from the ascent stage (0) to the
+// CSM (1) and is what the scene follows.
+function rendezvousState(plan,at,t,moon){
+  const R=RENDEZVOUS,f=localFrame(plan.lunarReturnParking,at);
+  let rel,lm,csm,focus=0,status=null,gap=0,rcs=0;
+  if(t<R.contact){
+    const a=approach(plan.rendezvous,t/R.contact);
+    rel=add(scale(a.u,-(DOCKED_KM+a.gap)),[0,a.across,0]);
+    lm=slerp(plan.rendezvous.lm0,a.u,ramp(0,.12,t/R.contact));csm=scale(a.u,-1);status='rendezvous';gap=a.gap;rcs=a.rcs;
+  }else if(t<R.jettison){
+    // Capture: the probe's latches hold, the vehicles rock a little and settle.
+    const s=clamp((t-R.contact)/(R.capture-R.contact),0,1),rock=.03*Math.exp(-3*s)*Math.sin(3*Math.PI*s);
+    rel=[-DOCKED_KM,0,0];lm=[Math.cos(rock),0,Math.sin(rock)];csm=[-1,0,0];status='docked';
+    focus=.72*ramp(0,.08,t-R.contact);
+  }else{
+    // The CSM backs away from the cast-off ascent stage, which tumbles slowly, then yaws round to face along its
+    // motion for the injection burn; the stage stays behind in lunar orbit.
+    const u=(t-R.jettison)/(1-R.jettison),sep=2*Math.pow(u,2.6),yaw=Math.PI*ramp(R.separated,R.turned,t);
+    rel=[-(DOCKED_KM+sep),0,-.04*sep];lm=[Math.cos(.5*u),0,Math.sin(.5*u)];csm=[-Math.cos(yaw),-Math.sin(yaw),0];
+    focus=.72+.28*ramp(R.jettison,R.separated+.04,t);status=t<R.separated?'jettison':t<R.turned?'turn':null;gap=sep;
+  }
+  const csmAt=add(moon,f.relative),lmAt=add(csmAt,fromLocal(f,rel));
+  return {lm:lmAt,csm:csmAt,lmAttitude:unit(fromLocal(f,lm)),csmAttitude:unit(fromLocal(f,csm)),focus,status,gapKm:gap,rangeKm:norm(subtract(csmAt,lmAt)),rcs};
+}
+// insertion: the ascent stage's own climb, which ends behind and below the CSM (RENDEZVOUS); without it, the arc
+// ends at the CSM's point in the 110 km orbit (that point defines the return orbit).
+function lunarArc(plan,ms,t,ascending,astronomy,insertion=ascending){
   const frame=lunarFrame(new Date(ms),astronomy),basis=siteBasis(plan.site);
   const ground=RADIUS_KM+plan.elevationKm,parking=RADIUS_KM+PARKING.lunarAltitudeKm;
   const local=ascending?t<=LOCAL_ASCENT_END:t>=LOCAL_DESCENT_START;
+  const top=insertion?parking-RENDEZVOUS.belowKm:parking,arc=plan.landingArc-(insertion?RENDEZVOUS.behindKm/parking:0);
   let angle=0,radius;
   if(local){
     const s=ascending?t/LOCAL_ASCENT_END:(t-LOCAL_DESCENT_START)/(1-LOCAL_DESCENT_START);
@@ -122,8 +183,8 @@ function lunarArc(plan,ms,t,ascending,astronomy){
   }else{
     const span=ascending?1-LOCAL_ASCENT_END:LOCAL_DESCENT_START,s=ascending?(t-LOCAL_ASCENT_END)/span:t/span;
     const rate=Math.sqrt(MOON_MU/parking**3),slope=rate*.25*HOUR/1000*span;
-    angle=ascending?hermite(0,plan.landingArc,0,slope,s):hermite(-plan.landingArc,0,slope,0,s);
-    radius=mix(ground+.4,parking,ascending?smooth(s):1-smooth(s));
+    angle=ascending?hermite(0,arc,0,slope,s):hermite(-plan.landingArc,0,slope,0,s);
+    radius=mix(ground+.4,top,ascending?smooth(s):1-smooth(s));
   }
   const radial=toInertial(rotate(basis.up,basis.north,angle),frame);
   return {relative:scale(radial,radius),radial,direction:toInertial(tangent(basis.up,basis.north,angle),frame),local,altitudeKm:radius-ground};
@@ -218,12 +279,18 @@ export function buildMission({site,windowStart,windowEnd,outboundHours=APOLLO.ou
   plan.earthParking=circularOrbit({body:'Earth',radiusKm:EARTH_RADIUS+PARKING.earthAltitudeKm,mu:EARTH_MU,
     p:rotate(p,q,plan.launchFrame.angle),q:tangent(p,q,plan.launchFrame.angle),start:launch+.2*HOUR,turns:PARKING.earthTurns});
   const descentStart=arrival-.25*HOUR,ascentEnd=departure+.25*HOUR;
-  const descentEntry=lunarArc(plan,descentStart,0,false,astronomy),ascentExit=lunarArc(plan,ascentEnd,1,true,astronomy);
+  const descentEntry=lunarArc(plan,descentStart,0,false,astronomy),ascentExit=lunarArc(plan,ascentEnd,1,true,astronomy,false);
   const lunarPeriod=TAU*Math.sqrt((RADIUS_KM+PARKING.lunarAltitudeKm)**3/MOON_MU);
   plan.lunarParking=circularOrbit({body:'Moon',radiusKm:RADIUS_KM+PARKING.lunarAltitudeKm,mu:MOON_MU,
     p:descentEntry.relative,q:descentEntry.direction,start:descentStart-plan.lunarTurns*lunarPeriod*1000,turns:plan.lunarTurns});
   plan.lunarReturnParking=circularOrbit({body:'Moon',radiusKm:RADIUS_KM+PARKING.lunarAltitudeKm,mu:MOON_MU,
     p:ascentExit.relative,q:ascentExit.direction,start:ascentEnd,turns:plan.lunarReturnTurns});
+  // Where the rendezvous starts, in the CSM's local frame at the orbit insertion: the line of sight to the CSM, its
+  // range and the ascent stage's attitude (its docking hatch, on top, faces along the motion after the climb).
+  {
+    const insertion=lunarArc(plan,ascentEnd,1,true,astronomy),f=localFrame(plan.lunarReturnParking,ascentEnd),rho=subtract(f.relative,insertion.relative),range=norm(rho);
+    plan.rendezvous={range0:range,u0:toLocal(f,scale(rho,1/range)),lm0:toLocal(f,insertion.direction)};
+  }
   const tliStart=plan.earthParking.end,tliEnd=tliStart+.1*HOUR;
   const loiEnd=plan.lunarParking.start,loiStart=loiEnd-.1*HOUR;
   // Whole turns: the orbit is at the same point at its start and end, so the burn can be drawn on the final arc.
@@ -277,7 +344,7 @@ export function buildMission({site,windowStart,windowEnd,outboundHours=APOLLO.ou
 export function sampleMission(plan,progress,astronomy){
   const p=clamp(progress,0,1),phase=PHASES.find(s=>p<s.end)||PHASES.at(-1),t=presentationTime(clamp((p-phase.start)/(phase.end-phase.start),0,1)),u=smooth(t);
   const [begin,end]=plan.times[phase.id],ms=mix(begin,end,t),date=new Date(ms),moon=moonPosition(date,astronomy),frame=lunarFrame(date,astronomy);
-  let position,direction,attitude=null,altitudeKm=0,local=false,engine=false,throttle=0,orbit=null,arc=null,altitudeReference='Terra',config='csm',plasma=0,chutes=null,ocean=false,pad=false,ignition=1,dock=null;
+  let position,direction,attitude=null,altitudeKm=0,local=false,engine=false,throttle=0,orbit=null,arc=null,altitudeReference='Terra',config='csm',plasma=0,chutes=null,ocean=false,pad=false,ignition=1,pair=null;
   // The clock runs through every lunar orbit (13 before the landing, 5 after the liftoff on Apollo 11); the
   // picture shows only the final arc into the descent on arrival, and one lap on the way out.
   let orbitFrom=null,orbitAt=null;
@@ -302,9 +369,10 @@ export function sampleMission(plan,progress,astronomy){
     case 'loi':around(plan.lunarParking,plan.lunarParking.radiusKm+200*(1-u),ms-plan.arrivalShift);engine=true;throttle=1;config='stack';break;
     case 'lunarOrbit':{orbit=plan.lunarParking;const arc=plan.arrivalShift;orbitFrom=orbit.end-arc;orbitAt=orbitFrom+arc*t;around(orbit,undefined,orbitAt);config='stack';break;}
     case 'lunarReturnOrbit':{orbit=plan.lunarReturnParking;const lap=orbit.periodSeconds*1000;orbitFrom=orbit.start;orbitAt=orbitFrom+lap*t;around(orbit,undefined,orbitAt);
-      // Rendezvous and docking (Apollo 11: liftoff 17:54, docking 21:35 UTC): the first fifth of the stage shows the
-      // ascent stage's final approach to the CSM and the docking; then the docked stack, and the ascent stage cut loose.
-      config=t<DOCK_END?'rendezvous':t<.56?'csmAscent':'csm';if(config==='rendezvous')dock=t/DOCK_END;break;}
+      // The CSM rides the drawn lap; the ascent stage closes on it, docks, is cast off. The picture follows the ascent
+      // stage until the docking, then the CSM (direction stays the CSM's motion along its orbit).
+      config='pair';pair=rendezvousState(plan,orbitAt,t,moon);position=add(pair.lm,scale(subtract(pair.csm,pair.lm),pair.focus));
+      altitudeKm=norm(subtract(position,moon))-RADIUS_KM;break;}
     case 'tei':around(plan.lunarReturnParking,plan.lunarReturnParking.radiusKm+200*u);engine=true;throttle=1;config='csm';break;
     case 'descent':case 'ascent':{
       arc=lunarArc(plan,ms,t,phase.id==='ascent',astronomy);position=add(moon,arc.relative);altitudeKm=Math.max(0,arc.altitudeKm);
@@ -315,7 +383,13 @@ export function sampleMission(plan,progress,astronomy){
       direction=rotate(arc.direction,arc.radial,pitch*Math.PI/2);
       if(phase.id==='descent')attitude=rotate(scale(arc.direction,-1),arc.radial,pitch*Math.PI/2);
       throttle=!engine?0:phase.id==='descent'?(altitudeKm>.6?1:.55+.45*clamp(altitudeKm/.6,0,1)):1;
-      config=phase.id==='descent'?'lm':'ascent';break;
+      config=phase.id==='descent'?'lm':'ascent';
+      // Above the site the CSM is in the picture: in its orbit ahead, its nose on the ascent stage (it tracked the LM).
+      if(phase.id==='ascent'&&!local){
+        const csm=add(moon,parkingState(plan.lunarReturnParking,ms).relative);config='pair';
+        pair={lm:position,csm,lmAttitude:direction,csmAttitude:unit(subtract(position,csm)),focus:0,status:'climb',gapKm:norm(subtract(csm,position))-DOCKED_KM,rangeKm:norm(subtract(csm,position)),rcs:0};
+      }
+      break;
     }
     case 'surface':position=lunarPoint(plan.site,date,astronomy,plan.elevationKm);local=true;altitudeReference='solo lunar';config='lm';break;
     case 'outbound':case 'inbound':{
@@ -352,7 +426,7 @@ export function sampleMission(plan,progress,astronomy){
     localDirection=[dot(bodyDirection,basis.east),dot(bodyDirection,basis.up),-dot(bodyDirection,basis.north)];
   }
   if(ocean||pad){localPosition=[0,altitudeKm,0];localDirection=[0,1,0];}
-  return {phase:phase.id,label:phase.label,t,date,position,direction,attitude,moon,frame,local,localPosition,localDirection,engine,throttle,config,dock,plasma,chutes,ocean,pad,ignition,orbit,orbitFrom,orbitAt,
+  return {phase:phase.id,label:phase.label,t,date,position,direction,attitude,moon,frame,local,localPosition,localDirection,engine,throttle,config,pair,plasma,chutes,ocean,pad,ignition,orbit,orbitFrom,orbitAt,
     orbitTurns:orbit?clamp((ms-orbit.start)/(orbit.periodSeconds*1000),0,orbit.turns):null,
     altitudeKm:Math.max(0,altitudeKm),altitudeReference,elapsedHours:(ms-plan.launch)/HOUR,distanceKm:norm(moon)};
 }

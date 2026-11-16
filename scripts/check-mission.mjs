@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import * as Astronomy from 'astronomy-engine';
 import { sites } from '../dist/sites.js';
-import { PHASES,ANIMATION_SECONDS,presentationTime,HOUR,EARTH_RADIUS,PARKING,APOLLO,buildMission,sampleMission,lunarPoint,geoPoint,parkingState } from '../dist/mission-model.js';
+import { PHASES,ANIMATION_SECONDS,presentationTime,HOUR,EARTH_RADIUS,PARKING,APOLLO,RENDEZVOUS,DOCKED_KM,buildMission,sampleMission,lunarPoint,geoPoint,parkingState } from '../dist/mission-model.js';
 import { RADIUS_KM } from '../dist/model.js';
 import * as THREE from 'three';
 import { MissionScene } from '../dist/mission-scene.js';
@@ -53,12 +53,41 @@ for(const [id,orbit] of [['earthOrbit',plan.earthParking],['lunarOrbit',plan.lun
     assert.ok(Math.abs(numericalSpeed-orbit.speedKmS)<1e-4,'Kepler speed must match propagated position');
     const sample=sampleMission(plan,progressAt(id,Math.min(i/100,.999999)),Astronomy);
     const center=orbit.body==='Earth'?[0,0,0]:sample.moon;
-    assert.ok(Math.abs(magnitude(difference(sample.position,center))-orbit.radiusKm)<1e-7);
+    // On the return orbit the picture follows the ascent stage until the docking; the CSM is the one on the orbit.
+    assert.ok(Math.abs(magnitude(difference(sample.pair?sample.pair.csm:sample.position,center))-orbit.radiusKm)<1e-7);
     assert.equal(sample.engine,false,'Parking is unpowered');
     const forward=parkingState(orbit,sample.orbitAt).direction;assert.ok(sample.orbitAt>=sample.orbitFrom&&sample.orbitAt-sample.orbitFrom<=Math.max(orbit.turns,1)*orbit.periodSeconds*1000+1,'Drawn orbit stays within its laps');
     assert.ok(sample.direction.reduce((sum,x,k)=>sum+x*forward[k],0)>1-1e-8,'No backward attitude in parking');
     assert.ok(sample.orbitTurns>=0&&sample.orbitTurns<=orbit.turns);
   }
+}
+// Rendezvous: the CSM is in the picture from the climb on, nothing appears or jumps at the stage change, the gap
+// closes steadily to contact, the docked ports meet, and the CSM ends facing along its motion for the injection.
+{
+  const dot=(a,b)=>a.reduce((s,x,i)=>s+x*b[i],0),unit=a=>a.map(x=>x/magnitude(a));
+  const climb=sampleMission(plan,progressAt('ascent',.9),Astronomy);
+  assert.equal(climb.config,'pair');assert.ok(Math.abs(magnitude(difference(climb.pair.csm,climb.moon))-plan.lunarReturnParking.radiusKm)<1e-7,'CSM in its orbit during the climb');
+  assert.ok(climb.pair.rangeKm<2000&&climb.pair.rangeKm>RENDEZVOUS.behindKm,'CSM ahead of the climbing ascent stage');
+  const end=sampleMission(plan,progressAt('lunarReturnOrbit',0)-1e-10,Astronomy),start=sampleMission(plan,progressAt('lunarReturnOrbit',0),Astronomy);
+  assert.ok(magnitude(difference(end.pair.lm,start.pair.lm))<1e-3,'Ascent stage continuous into the rendezvous');
+  assert.ok(magnitude(difference(end.pair.csm,start.pair.csm))<1e-3,'CSM continuous into the rendezvous');
+  assert.ok(dot(end.pair.lmAttitude,start.pair.lmAttitude)>.9999,'Ascent stage attitude continuous into the rendezvous');
+  assert.ok(Math.abs(start.altitudeKm-(PARKING.lunarAltitudeKm-RENDEZVOUS.belowKm))<.5,'Insertion below the CSM');
+  let gap=Infinity;
+  for(let i=0;i<=400;i++){
+    const s=sampleMission(plan,progressAt('lunarReturnOrbit',RENDEZVOUS.contact*i/400),Astronomy);
+    if(i<400){assert.equal(s.pair.status,'rendezvous');assert.ok(s.pair.gapKm<=gap+1e-9,'Gap closes monotonically');gap=s.pair.gapKm;}
+    assert.ok(s.pair.lm.every(Number.isFinite)&&s.pair.csm.every(Number.isFinite));
+  }
+  // Stage progress whose eased presentation clock reads t.
+  const progressAtClock=(id,t)=>{let a=0,b=1;for(let i=0;i<60;i++){const m=(a+b)/2;if(presentationTime(m)<t)a=m;else b=m;}return progressAt(id,b);};
+  const contact=sampleMission(plan,progressAtClock('lunarReturnOrbit',RENDEZVOUS.contact),Astronomy),axis=unit(difference(contact.pair.csm,contact.pair.lm));
+  assert.ok(Math.abs(contact.pair.rangeKm-DOCKED_KM)<1e-6,'Docked: origins 5.33 m apart');
+  assert.ok(dot(axis,contact.pair.lmAttitude)>.9999&&dot(axis,contact.pair.csmAttitude)<-.9999,'Docking ports face each other');
+  const last=sampleMission(plan,progressAt('lunarReturnOrbit',1)-1e-10,Astronomy),burn=sampleMission(plan,progressAt('tei',0),Astronomy);
+  assert.ok(magnitude(difference(last.position,last.pair.csm))<1e-6,'The picture is on the CSM at the end of the stage');
+  assert.ok(dot(last.pair.csmAttitude,burn.direction)>.999,'CSM faces along its motion for the injection');
+  assert.ok(last.pair.rangeKm>1,'Ascent stage left behind');
 }
 assert.equal(plan.earthParking.turns,PARKING.earthTurns);
 assert.equal(plan.lunarParking.turns,plan.lunarTurns);

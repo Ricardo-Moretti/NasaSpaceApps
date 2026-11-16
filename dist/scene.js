@@ -27,6 +27,31 @@ const lowPower = () => matchMedia('(max-width: 820px)').matches || (navigator.ha
 const G_MOON = .00162, JUMP_V = .00117, HOP_V = .00045;
 const WALK_SPEED = .0012, RUN_SPEED = .0025, WALK_KEYS = new Set(['w', 'a', 's', 'd', 'arrowup', 'arrowdown', 'arrowleft', 'arrowright', 'shift']);
 const reducedMotion = () => matchMedia('(prefers-reduced-motion: reduce)').matches;
+// Monotone cubic through (xs, ys) (Fritsch–Carlson), at rest at both ends: smooth, without overshoot.
+function smoothThrough(xs, ys) {
+  const n = xs.length, h = [], d = [], m = new Array(n).fill(0);
+  for (let i = 0; i < n - 1; i++) { h.push(xs[i + 1] - xs[i]); d.push((ys[i + 1] - ys[i]) / h[i]); }
+  for (let i = 1; i < n - 1; i++) if (d[i - 1] * d[i] > 0) { const a = 2 * h[i] + h[i - 1], b = h[i] + 2 * h[i - 1]; m[i] = (a + b) / (a / d[i - 1] + b / d[i]); }
+  return x => {
+    if (x <= xs[0]) return ys[0]; if (x >= xs[n - 1]) return ys[n - 1];
+    let i = 0; while (x > xs[i + 1]) i++;
+    const t = (x - xs[i]) / h[i], t2 = t * t, t3 = t2 * t;
+    return (2 * t3 - 3 * t2 + 1) * ys[i] + (t3 - 2 * t2 + t) * h[i] * m[i] + (-2 * t3 + 3 * t2) * ys[i + 1] + (t3 - t2) * h[i] * m[i + 1];
+  };
+}
+// Ground path (x, z) from a to b round a disc (c, r): straight when it clears the disc, otherwise along the tangents and
+// the arc between them, the shorter way round.
+function roundPath(a, b, c, r) {
+  const A = [a.x - c.x, a.z - c.z], B = [b.x - c.x, b.z - c.z], d = [B[0] - A[0], B[1] - A[1]];
+  const s = THREE.MathUtils.clamp(-(A[0] * d[0] + A[1] * d[1]) / Math.max(d[0] * d[0] + d[1] * d[1], 1e-18), 0, 1);
+  if (Math.hypot(A[0] + d[0] * s, A[1] + d[1] * s) >= r) return [a, b];
+  const ang = p => Math.atan2(p[1], p[0]), wrap = x => Math.atan2(Math.sin(x), Math.cos(x));
+  const side = Math.sign(wrap(ang(B) - ang(A))) || 1, t1 = ang(A) + side * Math.acos(Math.min(1, r / Math.max(Math.hypot(...A), r))), t2 = ang(B) - side * Math.acos(Math.min(1, r / Math.max(Math.hypot(...B), r)));
+  let sweep = wrap(t2 - t1); if (sweep * side < 0) sweep = Math.abs(sweep) < .3 ? 0 : sweep + side * 2 * Math.PI; // (a graze: no lap)
+  const n = Math.max(2, Math.ceil(Math.abs(sweep) / .2)), out = [a];
+  for (let i = 0; i <= n; i++) { const t = t1 + sweep * i / n; out.push({ x: c.x + Math.cos(t) * r, z: c.z + Math.sin(t) * r }); }
+  out.push(b); return out;
+}
 const Y_UP = new THREE.Vector3(0, 1, 0);
 
 function discTexture() {
@@ -186,6 +211,8 @@ export class LunarScene {
     // Walking in the surface view: the walker, an invisible body for its shadow, the helmet and the controls.
     this.walker = { x: 0, z: 0, keys: new Set(), last: performance.now(), phase: 0, checked: 0, helmet: true, visor: false, run: false, here: null, lander: true, air: false, vy: 0, yoff: 0, vx: 0, vz: 0 };
     this.makeAstronaut(); this.makeHelmet(canvas); this.makeWalkHud(container);
+    // Black over the scene for the cut on the way into the lunar module and the way out (the controls stay above it).
+    this.fade = document.createElement('div'); this.fade.className = 'scene-fade'; this.fade.setAttribute('aria-hidden', 'true'); this.helmet.after(this.fade);
     this.onWalkKey = e => {
       if (this.disposed) return;
       const key = e.key.toLowerCase(), el = document.activeElement;
@@ -237,7 +264,7 @@ export class LunarScene {
       const now = performance.now(), dt = Math.min(.1, (now - this.walker.last) / 1000); this.walker.last = now;
       if (this.view === 'surface' && !this.walker.cabin && (this.walker.keys.size || this.walker.air) && !this.suspended) { this.walk(dt); this.dirty = true; }
       if (this.dirty && !this.suspended && !document.hidden && !this.contextLost) {
-        if (this.cabinEntry) this.updateCabinEntry(now);
+        if (this.cabinEntry) this.updateCabinEntry(dt);
         this.frameView(); this.controls.update(); this.updateThickness();
         // Cached horizon pass only on Sun/relief changes; walking redraws only the small-object map.
         const walking = this.view === 'surface' && Boolean(this.landing);
@@ -355,7 +382,9 @@ export class LunarScene {
       this.updateHorizon(heightM);
     }
     this.placeSites(); this.orientStars(); this.applyView();
-    if (this.view === 'surface') { this.placeWalker(); this.checkHere(true); }
+    // In the lunar module (or on the way in) the walker stays put: placing it would pull the camera back to where the
+    // walker stood outside every time the clock moves (playback, a new date).
+    if (this.view === 'surface') { if (this.walker.cabin) this.placeNearLights(); else this.placeWalker(); this.checkHere(true); }
     this.walkTexts(); this.invalidate();
   }
 
@@ -435,7 +464,7 @@ export class LunarScene {
     this.observer.visible = this.view === 'terrain';
     const surface = this.view === 'surface', atPoint = Math.hypot(this.walker.x, this.walker.z) < .001;
     this.horizonLine.visible = surface && atPoint && !this.walker.cabin;
-    this.helmet.classList.toggle('on', surface && this.walker.helmet && !this.walker.cabin); this.helmet.classList.toggle('visor', this.walker.visor);
+    this.helmet.classList.toggle('on', surface && this.walker.helmet && !this.insideCabin()); this.helmet.classList.toggle('visor', this.walker.visor);
     this.walkHud.hidden = !surface; this.astronaut.visible = surface && Boolean(this.landing) && !this.walker.cabin;
     if (this.lander) this.lander.visible = surface && (this.walker.lander || this.walker.cabin);
     if (surface) this.ensureGround();
@@ -445,7 +474,7 @@ export class LunarScene {
   }
 
   setView(view) {
-    if (view !== 'surface') { this.walker.keys.clear(); this.landWalker(); if (this.walker.cabin) this.setCabin(false, false); }
+    if (view !== 'surface') { this.walker.keys.clear(); this.landWalker(); if (this.cabinPending) { this.cabinPending = null; this.setFade(0); } if (this.walker.cabin) this.setCabin(false, false); }
     this.view = view; this.sky.setView(view); this.applyView();
     if (this.result) { this.applyLights(); this.orientStars(); }
     this.resetCamera();
@@ -684,29 +713,112 @@ export class LunarScene {
   // 'Enter the lander': the camera at the Commander's eye, 1.5 m above the ascent-stage floor, looking out of the
   // left triangular window (Apollo crews flew the descent standing, in restraints). The exterior shell of the ascent
   // stage hides; the cabin's walls, its floodlights and the sunlight through the windows take over. Drag looks around.
-  setCabin(on, reset = true, animate = true) {
+  // 'Leave the lander' puts the walker at the foot of the ladder, facing the lunar module.
+  setCabin(on, reset = true, animate = true, fromBlack = false) {
     const w = this.walker; if (on && (!this.cabin || !this.lander || this.view !== 'surface')) return;
-    w.cabin = Boolean(on); w.keys.clear(); this.landWalker(); this.cabinEntry = null;
+    if (on && !this.cabinWarm && animate && !reducedMotion()) {
+      // The first time in, the cabin's shaders take 1–2 s to build on integrated GPUs: the picture dips to black at
+      // once (the click is answered), they build behind it, and the walk-in starts out of the black.
+      const token = this.cabinPending = {}; this.setFade(1, 250);
+      setTimeout(() => { if (this.cabinPending !== token) return; this.cabinPending = null; if (this.disposed || this.view !== 'surface' || w.cabin) { this.setFade(0); return; } this.warmCabin(); this.setCabin(true, reset, animate, true); }, 280);
+      return;
+    }
+    if (on) this.warmCabin();
+    w.cabin = Boolean(on); w.keys.clear(); this.landWalker(); this.cabinEntry = null; this.setFade(0);
     this.camera.near = w.cabin ? .00002 : .0005;
     if (w.cabin) {
       this.lander.updateMatrixWorld(true);
-      const L = p => this.cabin.group.localToWorld(new THREE.Vector3(...p));
-      // In through the front: to the porch at the top of the ladder, through the forward hatch (the exterior shell gives
-      // way to the cabin there), up to the Commander's station, then the turn to his window.
-      const path = [this.camera.position.clone(), L([.04, 3.9, 6.2]), L([.04, 3.72, 3.6]), L([.04, 3.66, 2.25]), L([.04, 3.8, 1.3]), L([.42, 4.5, .95]), L(this.cabin.eyes.cdr.toArray())];
-      const eye = path[path.length - 1], ahead = L(this.cabin.eyes.cdr.clone().add(this.cabin.lookDir).toArray()).sub(eye).normalize();
-      if (animate && !reducedMotion()) {
-        this.cabinEntry = { t0: performance.now(), duration: 3400, curve: new THREE.CatmullRomCurve3(path, false, 'centripetal'), ahead, inside: false };
-        this.setInteriorView(false);
-      } else this.setInteriorView(true);
-      this.controls.target.copy(eye); this.camera.position.copy(eye).addScaledVector(ahead, -.00008);
+      const F = this.landerFrame(), eye = F.at(this.cabin.eyes.cdr.toArray()), look = F.dir(0, Math.atan2(this.cabin.lookDir.y, this.cabin.lookDir.z));
+      if (animate && !reducedMotion()) { this.cabinEntry = this.entryPlan(F, fromBlack); this.setInteriorView(false); this.updateCabinEntry(0); }
+      else { this.setInteriorView(true); this.controls.target.copy(eye); this.camera.position.copy(eye).addScaledVector(look, -.00008); }
       this.setFov(70);
-      if (this.cabinEntry) this.updateCabinEntry(performance.now());
     } else this.setInteriorView(false);
     this.placeNearLights(); this.sunlight.shadow.needsUpdate = true;
     this.applyView(); this.walkTexts();
-    if (!w.cabin && reset) { this.resetCamera(); this.placeWalker(); this.checkHere(true); }
+    if (!w.cabin && reset) {
+      this.resetCamera();
+      if (this.lander) {
+        const F = this.landerFrame(), foot = F.at([.04, 0, 5.6]); w.x = foot.x; w.z = foot.z;
+        const eye = this.walkerEye(); this.controls.target.copy(eye); this.camera.position.copy(eye).addScaledVector(F.dir(Math.PI, .1), -.00008);
+        this.setFade(1); requestAnimationFrame(() => this.setFade(0, 400));
+      }
+      this.placeWalker(); this.checkHere(true); this.applyView(); this.walkTexts();
+    }
     this.camera.updateProjectionMatrix(); this.controls.update(); this.invalidate();
+  }
+  // Inside the cabin (not on the way in).
+  insideCabin() { return this.walker.cabin && (!this.cabinEntry || this.cabinEntry.inside); }
+  // The lunar module's own frame (metres: +Y up, +Z out of the forward hatch, +X the Commander's side) in the scene.
+  landerFrame() {
+    const g = this.cabin.group; g.updateWorldMatrix(true, false);
+    const o = g.localToWorld(new THREE.Vector3()), axis = v => g.localToWorld(new THREE.Vector3(...v)).sub(o).normalize();
+    const ex = axis([1, 0, 0]), ey = axis([0, 1, 0]), ez = axis([0, 0, 1]);
+    return { o, ex, ey, ez, at: p => g.localToWorld(new THREE.Vector3(...p)), toLocal: p => g.worldToLocal(p.clone()),
+      dir: (yaw, pitch) => ez.clone().multiplyScalar(Math.cos(yaw) * Math.cos(pitch)).addScaledVector(ex, Math.sin(yaw) * Math.cos(pitch)).addScaledVector(ey, Math.sin(pitch)).normalize(),
+      yaw: d => Math.atan2(d.dot(ex), d.dot(ez)) };
+  }
+  // The walk-in, on foot: round the legs (outside a 5.3 m circle) to the foot of the ladder on the forward leg, up the
+  // ladder to the porch, in through the forward hatch on hands and knees (there the exterior shell gives way to the
+  // cabin), up at the Commander's station and the turn to his window. From farther than ~9 m the walk is cut short: a
+  // dip to black and the walker is 3 m from the ladder. Keyframes in the lunar module's frame (metres): eye position,
+  // heading (0 = out of the hatch) and pitch, at times in seconds.
+  entryPlan(F, fromBlack = false) {
+    const eye0 = this.controls.target.clone(), above = Math.max(.0012, eye0.y - this.groundAt(eye0.x, eye0.z)), footEye = .00175;
+    const foot = F.at([.04, 0, 5.6]), path = roundPath({ x: eye0.x, z: eye0.z }, { x: foot.x, z: foot.z }, { x: F.o.x, z: F.o.z }, .0053);
+    const lengths = path.slice(1).map((p, i) => Math.hypot(p.x - path[i].x, p.z - path[i].z)), total = lengths.reduce((s, x) => s + x, 0);
+    const cut = total > .009 ? .3 : 0, from = cut ? total - .003 : 0;
+    // Points along the ground path every ~1.2 m from `from` to the ladder.
+    const pointAt = s => { let i = 0; while (i < lengths.length - 1 && s > lengths[i]) { s -= lengths[i]; i++; } const k = lengths[i] ? Math.min(1, s / lengths[i]) : 1; return { x: path[i].x + (path[i + 1].x - path[i].x) * k, z: path[i].z + (path[i + 1].z - path[i].z) * k }; };
+    const walk = total - from, steps = Math.max(1, Math.round(walk / .0012)), keys = [];
+    let time = cut, last = null;
+    for (let i = 0; i <= steps; i++) {
+      const s = from + walk * i / steps, q = pointAt(s), h = THREE.MathUtils.lerp(cut ? footEye + (above - footEye) * .3 : above, footEye, i / steps);
+      const p = new THREE.Vector3(q.x, this.groundAt(q.x, q.z) + h, q.z), ahead = i < steps ? (() => { const n = pointAt(Math.min(total, s + .0006)); return new THREE.Vector3(n.x - q.x, 0, n.z - q.z); })() : null;
+      if (last) time += Math.max(.12, last.distanceTo(p) * 1000 / 3.4) + (i === 1 ? .2 : 0);
+      // Looking mostly at the lunar module while going round it (a third of the way toward where the feet go).
+      const porch = F.at([.04, 3.3, 2.5]).sub(p).setY(0), toward = F.yaw(porch.normalize()), along = !ahead || ahead.lengthSq() < 1e-14 ? toward : F.yaw(ahead.normalize());
+      keys.push({ t: time, p, yaw: i === steps ? Math.PI : toward + .35 * Math.atan2(Math.sin(along - toward), Math.cos(along - toward)), pitch: i === steps ? .2 : .08 }); last = p;
+    }
+    // Without a cut the first frame keeps the look the walker had, then turns to the way it walks.
+    if (!cut) { const d = this.controls.target.clone().sub(this.camera.position).normalize(); keys[0].yaw = F.yaw(d); keys[0].pitch = Math.asin(THREE.MathUtils.clamp(d.dot(F.ey), -1, 1)); }
+    // From the foot of the ladder: climb, kneel on the porch, through the hatch, stand, turn to the window.
+    const cdr = this.cabin.eyes.cdr, look = Math.atan2(this.cabin.lookDir.y, this.cabin.lookDir.z);
+    for (const [dt, p, yaw, pitch] of [[.35, [.04, 2.3, 4.55], Math.PI, .25], [.55, [.04, 3.25, 3.75], Math.PI, .05], [.55, [.04, 4.3, 3.05], Math.PI, -.35], [.3, [.04, 3.98, 2.72], Math.PI, -.3],
+      [.3, [.04, 3.6, 2.12], Math.PI, -.1], [.25, [.04, 3.62, 1.42], Math.PI, 0], [.5, [.3, 4.4, 1.05], Math.PI - .9, 0], [.4, [cdr.x, cdr.y, cdr.z + .002], Math.PI - 2, -.1], [.7, [cdr.x, cdr.y, cdr.z], 0, look]]) {
+      time += dt; keys.push({ t: time, p: F.at(p), yaw, pitch });
+    }
+    // Headings unwrapped (no turn the long way round), then the eye moved along a smooth curve at a smooth speed.
+    for (let i = 1; i < keys.length; i++) { let y = keys[i].yaw; while (y - keys[i - 1].yaw > Math.PI) y -= 2 * Math.PI; while (y - keys[i - 1].yaw < -Math.PI) y += 2 * Math.PI; keys[i].yaw = y; }
+    const curve = new THREE.CatmullRomCurve3(keys.map(k => k.p), false, 'centripetal'), n = 400, lens = curve.getLengths(n), length = lens[n];
+    const at = u => { const x = u * n, i = Math.min(n - 1, Math.floor(x)); return lens[i] + (lens[i + 1] - lens[i]) * (x - i); };
+    const ts = keys.map(k => k.t);
+    return { F, time: 0, cut, fromBlack, end: time, curve, length, inside: false, start: { target: this.controls.target.clone(), camera: this.camera.position.clone() },
+      s: smoothThrough(ts, keys.map((_, i) => at(i / (keys.length - 1)))), yaw: smoothThrough(ts, keys.map(k => k.yaw)), pitch: smoothThrough(ts, keys.map(k => k.pitch)) };
+  }
+  // One frame of the walk-in. Its clock runs on the frames drawn (at most 100 ms each), so a stall cannot skip the
+  // hatch; the shell gives way to the cabin when the eye passes the forward hatch.
+  updateCabinEntry(dt) {
+    const e = this.cabinEntry; if (!e) return;
+    e.time += Math.min(dt, .1); const t = e.time;
+    if (t < e.cut) { this.setFade(e.fromBlack ? 1 : t / e.cut); this.controls.target.copy(e.start.target); this.camera.position.copy(e.start.camera); this.invalidate(); return; }
+    const p = e.curve.getPointAt(THREE.MathUtils.clamp(e.s(t) / e.length, 0, 1)), look = e.F.dir(e.yaw(t), e.pitch(t)), q = e.F.toLocal(p);
+    // Through the 0.7 m of hatch tunnel between the hull and the cabin the view goes dark, as a head in a dark hatch:
+    // it hides the hull giving way to the cabin and the inside of the closed inner hatch.
+    const dark = q.y > 3.1 ? (1 - THREE.MathUtils.smoothstep(q.z, 2.25, 2.45)) * THREE.MathUtils.smoothstep(q.z, 1.36, 1.5) : 0;
+    this.setFade(Math.max(e.cut || e.fromBlack ? Math.max(0, 1 - (t - e.cut) / .3) : 0, dark));
+    if (!e.inside && q.z < 2.25 && q.y > 3.1) { e.inside = true; this.setInteriorView(true); this.applyView(); }
+    this.controls.target.copy(p); this.camera.position.copy(p).addScaledVector(look, -.00008); this.controls.update();
+    if (t >= e.end) { this.cabinEntry = null; this.setInteriorView(true); this.setFade(0); this.applyView(); this.walkTexts(); }
+    this.invalidate();
+  }
+  // Black over the scene (0..1), at once or over ms milliseconds; the controls stay above it.
+  setFade(k, ms = 0) { if (!this.fade) return; this.fade.style.transition = ms ? `opacity ${ms}ms ease-out` : 'none'; this.fade.style.opacity = String(k); }
+  // The cabin's materials, and its lamps (they change the light count every shader in view is built for), compiled once
+  // with the cabin shown, into the target the scene is drawn to: otherwise the first entry stalls 1–2 s on its way in.
+  warmCabin() {
+    if (!this.cabin || this.cabinWarm) return; this.cabinWarm = true;
+    const g = this.cabin.group, was = g.visible, r = this.renderer, previous = r.getRenderTarget(); g.visible = true;
+    try { r.setRenderTarget(this.sky?.composer?.readBuffer || null); r.compile(this.scene, this.camera); } catch { /* compiled on first use instead */ } finally { r.setRenderTarget(previous); g.visible = was; }
   }
   // Cabin shown and exterior shell hidden (inside), or the other way round.
   setInteriorView(inside) {
@@ -714,21 +826,11 @@ export class LunarScene {
     this.cabin.group.visible = inside; this.cabin.setInterior(inside);
     for (const [light, intensity] of this.cabin.lights) light.intensity = inside ? intensity : 0;
   }
-  // One step of the walk-in: position along the path, the look along it, then toward the window; done after 2.6 s.
-  updateCabinEntry(now) {
-    const e = this.cabinEntry; if (!e) return;
-    const k = Math.min(1, (now - e.t0) / e.duration), u = k * k * (3 - 2 * k), p = e.curve.getPointAt(u);
-    if (!e.inside && u > .55) { e.inside = true; this.setInteriorView(true); }
-    const along = e.curve.getTangentAt(Math.min(u, .999)), look = along.lerp(e.ahead, THREE.MathUtils.smoothstep(u, .7, 1)).normalize();
-    this.controls.target.copy(p); this.camera.position.copy(p).addScaledVector(look, -.00008); this.controls.update();
-    if (k >= 1) { this.cabinEntry = null; this.setInteriorView(true); }
-    this.invalidate();
-  }
   // Back on the ground at once, with no speed left (a new start, or leaving the surface view).
   landWalker() { Object.assign(this.walker, { air: false, vy: 0, yoff: 0, vx: 0, vz: 0 }); }
   // A jump straight up from where the walker stands, keeping the horizontal speed it had (no steering in the air).
   jump(speed = JUMP_V) {
-    const w = this.walker; if (w.air || this.view !== 'surface') return;
+    const w = this.walker; if (w.air || this.view !== 'surface' || w.cabin) return;
     const v = this.moveVector(); w.vx = v.x; w.vz = v.z; w.air = true; w.vy = speed; this.invalidate();
   }
   // Horizontal velocity the keys ask for (km/s).
@@ -831,11 +933,16 @@ export class LunarScene {
       b.addEventListener('pointerdown', e => { e.preventDefault(); b.setPointerCapture?.(e.pointerId); this.walker.keys.add(key); b.classList.add('held'); this.invalidate(); });
       for (const type of ['pointerup', 'pointercancel', 'lostpointercapture']) b.addEventListener(type, stop);
     });
-    el.querySelectorAll('[data-walk-opt]').forEach(b => b.addEventListener('click', () => {
+    el.querySelectorAll('[data-walk-opt]').forEach(b => b.addEventListener('click', e => {
+      // A button pressed with the pointer gives the focus back: Space is the jump key, and on a focused button it would
+      // press the button again (out of the lunar module, or back in). From the keyboard (detail 0) the focus stays.
+      if (e.detail) b.blur();
       const opt = b.dataset.walkOpt, w = this.walker;
       if (opt === 'jump') { this.jump(); return; }
-      if (opt === 'cabin') { this.setCabin(!w.cabin); return; }
-      if (opt === 'back') { if (w.cabin) this.setCabin(false); this.resetCamera(); this.placeWalker(); this.checkHere(true); this.applyView(); this.walkTexts(); return; }
+      // While walking in, the button does nothing: a second click (or a double click) used to cancel half-way and
+      // throw the walker back to the reference point.
+      if (opt === 'cabin') { if (!this.cabinEntry && !this.cabinPending) this.setCabin(!w.cabin); return; }
+      if (opt === 'back') { if (this.cabinPending) { this.cabinPending = null; this.setFade(0); } if (w.cabin) this.setCabin(false); this.resetCamera(); this.placeWalker(); this.checkHere(true); this.applyView(); this.walkTexts(); return; }
       const on = b.getAttribute('aria-pressed') !== 'true'; b.setAttribute('aria-pressed', String(on));
       if (opt === 'helmet') w.helmet = on; else if (opt === 'visor') w.visor = on; else if (opt === 'lander') { w.lander = on; this.checkHere(true); } else w.run = on;
       this.applyView(); this.invalidate();
@@ -854,7 +961,7 @@ export class LunarScene {
     const info = el.querySelector('.walk-info');
     if (el.dataset.state === 'preparing') { put(info, t('walk.preparing')); return; }
     const cabinButton = el.querySelector('[data-walk-opt="cabin"]'); cabinButton.hidden = !this.cabin; attr(cabinButton, 'aria-pressed', String(Boolean(w.cabin)));
-    if (w.cabin) { put(info, t('walk.inCabin')); return; }
+    if (this.insideCabin()) { put(info, t('walk.inCabin')); return; }
     const d = Math.hypot(w.x, w.z) * 1000, compass = t('compass8').split(','), dir = compass[Math.round(((Math.atan2(w.x, -w.z) * 180 / Math.PI + 360) % 360) / 45) % 8];
     const where = d < 1 ? t('walk.at') : t('walk.where', { d: number(Math.round(d)), dir });
     const here = w.here ? t('walk.here', { sun: t(w.here.eclipse >= 1 && w.here.sun ? 'walk.sun.eclipse' : w.here.lander ? 'walk.sun.lander' : w.here.sun ? 'walk.sun.lit' : 'walk.sun.shade'), earth: t(w.here.earth ? 'walk.earth.on' : 'walk.earth.off') }) : '';
@@ -885,7 +992,7 @@ export class LunarScene {
   dispose() {
     this.disposed = true; cancelAnimationFrame(this.frame); this.resizeObserver.disconnect(); this.controls.dispose(); this.sky.dispose(); this.groundLight.dispose(); this.renderer.dispose();
     window.removeEventListener('keydown', this.onWalkKey); window.removeEventListener('keyup', this.onWalkKey); window.removeEventListener('blur', this.onWalkBlur);
-    this.landing?.dispose(); this.landerMaterials?.dispose(); this.landerEnv?.dispose(); this.helmet.remove(); this.walkHud.remove();
+    this.landing?.dispose(); this.landerMaterials?.dispose(); this.landerEnv?.dispose(); this.helmet.remove(); this.fade.remove(); this.walkHud.remove();
     [...this.siteLabels, ...this.blockLabels, ...this.sitePins.map(p => p.el)].forEach(el => el.remove());
   }
 }

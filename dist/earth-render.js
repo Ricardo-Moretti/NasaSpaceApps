@@ -677,7 +677,10 @@ export function createEarthRenderer(renderer, { day, night, brc, clouds = null, 
       if (!(key in maps)) continue; const tex = maps[key]; U[name].value = tex;
       // Repeat across the antimeridian (finite differences and the seam-free derivatives step over it).
       // Anisotropy 8: near the horizon, where 16x costs most on integrated GPUs, the haze hides the difference.
-      if (tex) { tex.wrapS = THREE.RepeatWrapping; tex.anisotropy = Math.min(anisotropy, renderer.capabilities.getMaxAnisotropy()); tex.needsUpdate = tex.image ? true : tex.needsUpdate; }
+      // Only when a parameter changes: needsUpdate re-uploads the whole image, and an 8k map already on the GPU would go
+      // up again at the next draw (~0.3 s each on integrated GPUs, a visible freeze).
+      const aniso = Math.min(anisotropy, renderer.capabilities.getMaxAnisotropy());
+      if (tex && (tex.wrapS !== THREE.RepeatWrapping || tex.anisotropy !== aniso)) { tex.wrapS = THREE.RepeatWrapping; tex.anisotropy = aniso; tex.needsUpdate = tex.image ? true : tex.needsUpdate; }
     }
     if (maps.dayStyle) style = DAY_STYLES[maps.dayStyle] || DAY_STYLES['4k'];
     U.uDayStyle.value.set(...style.sea, style.gain); U.uLandSat.value = style.sat;

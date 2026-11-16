@@ -1,13 +1,13 @@
 import * as THREE from 'three';
 import { OrbitControls } from 'three/addons/controls/OrbitControls.js';
 import { RADIUS_KM, siteBasis } from './model.js';
-import { EARTH_RADIUS, APOLLO, moonPosition, parkingPath, parkingState, toInertial } from './mission-model.js';
+import { EARTH_RADIUS, APOLLO, RENDEZVOUS, moonPosition, parkingPath, parkingState, toInertial } from './mission-model.js';
 import { lunarMaterial, regolithNormalMap, detailedTerrainGeometry, contextTerrainGeometry, innerTerrainGeometry, orbitalPatchGeometry, globeSpace, siteSpace, earthshineUniforms, earthshineIrradiance, DETAIL_GLOBE, DETAIL_PATCH, DETAIL_CONTEXT, DETAIL_TILE, DETAIL_INNER } from './lunar-surface.js';
 import { loadStarCatalog } from './stars.js';
 import { createEarthRenderer } from './earth-render.js';
 import { createOcean } from './ocean.js';
 import { CameraFX } from './camera-fx.js';
-import { Spacecraft, createMaterials, makeEnvironment, buildDescentStage, buildSpent, setLayer } from './spacecraft.js';
+import { Spacecraft, createMaterials, makeEnvironment, buildDescentStage, buildSpent, setLayer, glowTexture } from './spacecraft.js';
 import { LandingSite } from './landing-site.js';
 import { LaunchPad, PAD_DECK } from './launch-pad.js';
 import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
@@ -36,6 +36,10 @@ const EARTHSHINE_BOOST=400;
 // at EV 0 and the true starlight (Pogson, anchored on the Sun) would be black. Close views keep the true sky, and the
 // camera opens at most 3 stops there, so the night licences (city lights, airglow, earthshine) are not multiplied.
 const DIAGRAM_STARS=2**20,DIAGRAM_MILKY_WAY=2**22,CLOSE_MAX_EV=1;
+// On the night side of the Moon the spacecraft have only the Earth's light (and their own flashing lights): there the
+// camera opens up to 4 stops, a long exposure, as night pictures are made; with the earthshine licence above, the
+// spacecraft and the ground below read in the ashen light instead of black.
+const LUNAR_NIGHT_EV=4;
 const clamp=(x,a=0,b=1)=>Math.max(a,Math.min(b,x));
 const LUNAR_PHASES=new Set(['loi','lunarOrbit','descent','surface','ascent','lunarReturnOrbit','tei']);
 const EARTH_PHASES=new Set(['liftoff','launch','earthOrbit','tli','arrival']);
@@ -46,8 +50,30 @@ const LOCAL_VIEW=new THREE.Vector3(.032,.009,.044); // ~55 m from the lander, 13
 function sideLitView(sun){const h=new THREE.Vector3(sun[0],0,sun[2]);if(h.lengthSq()<1e-8)return LOCAL_VIEW.clone();h.normalize().applyAxisAngle(Y,1.95);return h.multiplyScalar(.0545).setY(.009);}
 const PAD_CAMERA=new THREE.Vector3(.31,.012,.27); // press site: ~410 m from the pad, on the ground
 // What is dropped along the way: [model, stage, from, to, first gap (m), drift over the window (m)].
-const SPENT=[['sic','launch',.23,.42,95,900],['sii','launch',.785,.97,60,700],['sivb','outbound',0,.12,45,520],['asc','lunarReturnOrbit',.56,.7,14,200],['sm','arrival',0,.2,18,420]];
+// (The ascent stage cast off in lunar orbit is part of the rendezvous pair, spacecraft.js.)
+const SPENT=[['sic','launch',.23,.42,95,900],['sii','launch',.785,.97,60,700],['sivb','outbound',0,.12,45,520],['sm','arrival',0,.2,18,420]];
 function mesh(geometry,material,parent,position){const m=new THREE.Mesh(geometry,material);if(position)m.position.set(...position);m.castShadow=true;m.receiveShadow=true;parent.add(m);return m;}
+const ramp=(a,b,x)=>THREE.MathUtils.smoothstep(x,a,b);
+// Roll held against the nearer body (its local vertical), as a spacecraft holds attitude in orbit: without it a model
+// would turn about its own axis as its attitude sweeps around. Y along the attitude.
+function holdAttitude(attitude,at,centre){
+  const out=at.clone().sub(centre).normalize();let z=out.clone().addScaledVector(attitude,-out.dot(attitude));
+  if(z.lengthSq()<1e-4)z=new THREE.Vector3().crossVectors(attitude,Math.abs(attitude.y)<.9?Y:new THREE.Vector3(1,0,0));z.normalize();
+  return new THREE.Quaternion().setFromRotationMatrix(new THREE.Matrix4().makeBasis(new THREE.Vector3().crossVectors(attitude,z),attitude,z));
+}
+const slerpDir=(a,b,k)=>a.clone().applyQuaternion(new THREE.Quaternion().slerp(new THREE.Quaternion().setFromUnitVectors(a,b),k));
+// Between two framings the camera swings round the moving target (direction along the arc, distance in log) instead of
+// cutting across the scene, where a straight blend can leave both spacecraft out of the picture.
+function orbitBlend(a,b,k){
+  const target=a.target.clone().lerp(b.target,k),oa=a.position.clone().sub(a.target),ob=b.position.clone().sub(b.target);
+  const la=Math.max(oa.length(),1e-12),lb=Math.max(ob.length(),1e-12),dir=slerpDir(oa.divideScalar(la),ob.divideScalar(lb),k);
+  return {position:target.clone().addScaledVector(dir,Math.exp(THREE.MathUtils.lerp(Math.log(la),Math.log(lb),k))),target,up:(a.up||Y).clone().lerp(b.up||Y,k).normalize()};
+}
+// A spacecraft too far away to resolve: a point, drawn over the second pass (the Moon's disc is checked separately).
+function makeGlint(){
+  const g=new THREE.Points(new THREE.BufferGeometry().setAttribute('position',new THREE.Float32BufferAttribute([0,0,0],3)),new THREE.PointsMaterial({size:9,sizeAttenuation:false,map:glowTexture(),color:0xffffff,transparent:true,depthTest:false,depthWrite:false,blending:THREE.AdditiveBlending}));
+  g.frustumCulled=false;g.visible=false;g.renderOrder=10;return g;
+}
 
 export class MissionScene {
   constructor(canvas,container,terrain,onError,{t=k=>k,nasa=null}={}){
@@ -83,6 +109,8 @@ export class MissionScene {
     this.shine=new THREE.DirectionalLight(0xffffff,0);this.shine.layers.set(1);this.scene.add(this.shine,this.shine.target);
     // Starlight and stray light: just enough to read the spacecraft inside a shadow.
     this.shade=new THREE.AmbientLight(0x93a8cc,.2);this.shade.layers.set(1);this.scene.add(this.shade);
+    // Earthshine on the spacecraft near the Moon (second pass only): from the Earth, when it is above the Moon's limb.
+    this.earthshineLight=new THREE.DirectionalLight(0xbcccff,0);this.earthshineLight.layers.set(1);this.scene.add(this.earthshineLight,this.earthshineLight.target);
     // On the Moon: light the sunlit regolith sends back up to the shaded side of the lander.
     this.bounce=new THREE.HemisphereLight(0x000000,0xcfc8bc,0);this.scene.add(this.bounce);
     // What polished metal reflects: regolith near the Moon, oceans and clouds near the Earth, sky over the Pacific.
@@ -106,6 +134,7 @@ export class MissionScene {
     this.moon=mesh(new THREE.SphereGeometry(RADIUS_KM/1000,256,192),lunarMaterial({vertexColors:false,map:texture('moon-color.jpg',true,'error.moonTexture'),color:0xf2efe8,normalMap:texture('moon-normal.jpg',false),normalScale:1.25,normalY:1,hole:this.moonHole,space:globeSpace(),earthshine:this.earthshine,detail:DETAIL_GLOBE}),this.world);
     this.localEarth=mesh(new THREE.SphereGeometry(1,48,32),new THREE.MeshStandardMaterial({map:this.earthDay,roughness:.85}),this.local);
     this.vehicle=new Spacecraft(this.materials,nasa);setLayer(this.vehicle.group,1);this.world.add(this.vehicle.group);
+    this.glints={lm:makeGlint(),csm:makeGlint()};for(const g of Object.values(this.glints)){setLayer(g,1);this.world.add(g);}
     this.spent={};for(const [kind] of SPENT){const g=new THREE.Group(),body=new THREE.Group();body.scale.setScalar(.001);body.add(buildSpent(this.materials,kind,nasa));g.add(body);g.visible=false;setLayer(g,1);this.world.add(g);this.spent[kind]=g;}
     this.localVehicle=new Spacecraft(this.materials,nasa);this.local.add(this.localVehicle.group);
     if(await step(.45))return;
@@ -181,7 +210,8 @@ export class MissionScene {
     const sunColor=sun.color.clone();if(this.sunTint)sun.color.multiply(this.sunTint);
     sun.intensity=intensity*this.sunOnVehicle;sun.target.position.copy(at);sun.position.copy(at).addScaledVector(this.sunWorld,reach*6);sun.target.updateMatrixWorld();
     Object.assign(shadow.camera,{left:-reach,right:reach,top:reach,bottom:-reach,near:reach,far:reach*12});shadow.camera.updateProjectionMatrix();shadow.normalBias=reach*.004;shadow.bias=-.0006;
-    r.clearDepth();camera.layers.set(1);camera.near=Math.max(1e-9,d*.04);camera.far=d*60+.002;camera.updateProjectionMatrix();r.render(this.scene,camera);camera.layers.set(0);
+    // The far plane also holds the other spacecraft of the rendezvous, up to the tens of kilometres it starts at.
+    r.clearDepth();camera.layers.set(1);camera.near=Math.max(1e-9,d*.04);camera.far=Math.max(d*60+.002,this.vehicleFar||0);camera.updateProjectionMatrix();r.render(this.scene,camera);camera.layers.set(0);
     sun.intensity=intensity;sun.color.copy(sunColor);sun.position.copy(position);sun.target.position.copy(aim);shadow.normalBias=.00004;shadow.bias=-.00002;
   }
   // The Earth, the Moon, the Sun and the stars as the spacecraft sees them, filtered for reflections.
@@ -298,15 +328,17 @@ export class MissionScene {
     // Greenwich faces the sidereal angle (precession ignored: visual only).
     this.earth.rotation.y=window.Astronomy.SiderealTime(sample.date)*Math.PI/12;
     // Vehicle: the stage, module or capsule flying at this moment of the Apollo profile.
-    this.vehicle.set(sample.config);if(sample.config==='rendezvous')this.vehicle.rendezvous(sample.dock);this.engineLevel=sample.throttle||0;
-    const attitude=v(sample.attitude||sample.direction).normalize();
+    this.vehicle.set(sample.config);this.engineLevel=sample.throttle||0;
+    const attitude=v(sample.attitude||sample.direction).normalize(),holdCentre=earthSide?new THREE.Vector3():this.moon.position;
     this.vehicle.group.position.copy(space(sample.position));this.vehicle.group.visible=!coast;
-    {
-      // Roll is held against the nearer body (local vertical), as a spacecraft holds attitude in orbit:
-      // without it the model would turn about its own axis as the velocity vector sweeps around.
-      const centre=earthSide?new THREE.Vector3():this.moon.position,out=this.vehicle.group.position.clone().sub(centre).normalize();
-      let z=out.clone().addScaledVector(attitude,-out.dot(attitude));if(z.lengthSq()<1e-4)z=new THREE.Vector3().crossVectors(attitude,Math.abs(attitude.y)<.9?Y:new THREE.Vector3(1,0,0));z.normalize();
-      this.vehicle.group.quaternion.setFromRotationMatrix(new THREE.Matrix4().makeBasis(new THREE.Vector3().crossVectors(attitude,z),attitude,z));
+    this.vehicle.group.quaternion.copy(holdAttitude(attitude,this.vehicle.group.position,holdCentre));
+    // The lunar rendezvous: the ascent stage and the CSM each where the mission model puts them, with their own
+    // attitudes (the vehicle frame stays unrotated; its origin is the point the picture follows).
+    this.pairState=null;
+    if(sample.config==='pair'&&sample.pair){
+      const P=sample.pair,lm=space(P.lm),csm=space(P.csm),lmAtt=v(P.lmAttitude).normalize(),csmAtt=v(P.csmAttitude).normalize();
+      this.pairState={lm,csm,lmAtt,csmAtt,lmQ:holdAttitude(lmAtt,lm,holdCentre),csmQ:holdAttitude(csmAtt,csm,holdCentre),gapKm:P.gapKm,rangeKm:P.rangeKm,status:P.status,rcs:P.rcs||0};
+      this.vehicle.group.quaternion.identity();
     }
     const localTarget=sample.localPosition?new THREE.Vector3(...sample.localPosition):new THREE.Vector3(0,sample.altitudeKm,0);
     localTarget.y+=this.groundY;
@@ -376,7 +408,11 @@ export class MissionScene {
       const centre=earthSide?new THREE.Vector3():this.moon.position,radius=(earthSide?EARTH_RADIUS:RADIUS_KM)/1000,out=this.vehicle.group.position.clone().sub(centre),distance=out.length();out.normalize();
       this.shine.color.set(earthSide?0x9cc0ff:0xcfc8bc);this.shine.intensity=(earthSide?1.5:.55)*Math.max(0,out.dot(sunWorld))*Math.pow(radius/distance,2);
       this.shine.target.position.copy(this.vehicle.group.position);this.shine.position.copy(this.vehicle.group.position).addScaledVector(out,-1);
-    }
+      // Near the Moon, the Earth's light: its phase as seen from here, nothing when the Moon hides it.
+      const at=this.vehicle.group.position,toEarth=at.clone().negate().normalize();
+      this.earthshineLight.intensity=earthSide||this.rayHitsMoon(at,toEarth)?0:earthshineIrradiance(Math.acos(THREE.MathUtils.clamp(sunWorld.dot(at.clone().normalize()),-1,1)),at.length()*1000,EARTHSHINE_BOOST);
+      this.earthshineLight.target.position.copy(at);this.earthshineLight.position.copy(at).add(toEarth);
+    }else this.earthshineLight.intensity=0;
     // Exhaust and entry plasma, once the sunlight on the vehicle is known: altitude shapes the F-1 plume, fades the
     // entry glow below ~45 km and times the lunar-liftoff debris; groundKm clips the exhaust at the surface.
     const lit=this.sunOnVehicle*(world&&this.sunTint?Math.max(this.sunTint.r,this.sunTint.g,this.sunTint.b):1);
@@ -384,7 +420,8 @@ export class MissionScene {
     this.vehicle.plasma(sample.plasma||0,{altitudeKm:sample.altitudeKm});
     this.renderer.toneMappingExposure=local?.92:1;
     // Camera.
-    const orbit=this.orbitForPhase(sample),key=pad?'pad':ocean?'ocean':local?'local':overview?'overview':this.mode==='follow'?'follow':coast?`coast-${coast}`:chase?'chase':sample.phase;
+    // A new stage beside the spacecraft is a new shot: the camera blends into its framing instead of jumping to it.
+    const orbit=this.orbitForPhase(sample),key=pad?'pad':ocean?'ocean':local?'local':overview?'overview':this.mode==='follow'?'follow':coast?`coast-${coast}`:chase?`chase-${sample.phase}`:sample.phase;
     const padTarget=pad?new THREE.Vector3(0,PAD_DECK+sample.altitudeKm+.055,0):null;this.padTarget=padTarget;
     const target=pad?padTarget:ocean?this.oceanVehicle.group.position.clone().add(new THREE.Vector3(0,.021,0)):local?lv.group.position.clone().add(new THREE.Vector3(0,.004,0)):null;
     if(reset||key!==this.cameraKey){
@@ -404,7 +441,7 @@ export class MissionScene {
         if(ocean&&this.camera.position.y<.003)this.camera.position.y=.003;this.controls.update();this.lastPosition=follow.clone();}
     }
     if(world&&this.mode==='auto'&&(flight||chase||coast)&&!this.manualCamera){
-      const pose=flight?this.flightCameraPose(sample):coast?this.coastNow:this.chasePose(sample);
+      const pose=coast?this.coastNow:this.autoPose(sample,flight);
       if(this.cameraTween)this.cameraTween.to=pose;
       else{this.camera.position.copy(pose.position);this.controls.target.copy(pose.target);this.camera.up.copy(pose.up);this.controls.update();}
     }
@@ -421,6 +458,7 @@ export class MissionScene {
     // Beside the spacecraft everything is true size; in the wide views the vehicle is enlarged to stay visible.
     const close=this.mode==='follow',ref=this.vehicle.height,trueSize=flight||chase||Boolean(this.cameraTween);
     const size=this.camera.position.distanceTo(this.vehicle.group.position)*(close?.055:.022)/ref,scale=Math.max(trueSize?.001:4*.014/ref,trueSize?0:size);this.vehicle.group.scale.setScalar(scale);
+    this.updatePair(scale,trueSize);
     // Spent stages fall behind, slowly tumbling.
     for(const [kind,phase,from,to,gap,drift] of SPENT){
       const g=this.spent[kind],on=world&&!coast&&sample.phase===phase&&sample.t>=from&&sample.t<=to;g.visible=on;if(!on)continue;
@@ -432,9 +470,36 @@ export class MissionScene {
     const height=Math.max(0,sample.altitudeKm)*.001;
     this.nearA=flight||chase?clamp(height*.25,1e-5,.02):coast?Math.max(.01,this.coastNow.distance*.02):Math.max(1e-8,Math.min(.0005,this.camera.position.distanceTo(this.controls.target)*.02));
     this.camera.near=local||ocean||pad?.0001:this.nearA;this.camera.far=ocean||pad?200:10000;this.camera.updateProjectionMatrix();
-    const night=sky&&sky.day<.15;
-    document.getElementById('missionScale').textContent=(pad?this.t('msc.pad'):ocean?this.t('msc.ocean'):local?this.t(sample.config==='ascent'?'msc.localAscent':'msc.local'):flight?this.t('msc.approach'):coast?this.t(`msc.${coast}${this.coastNow.body}`):chase?this.t(earthSide?'msc.chaseEarth':'msc.chaseMoon'):sample.orbit?this.t('msc.orbit'):this.t('msc.space'))+(dark?` · ${this.t('light.reading')}`:'')+(night?` · ${this.t('msc.night')}`:'');
+    const night=sky&&sky.day<.15,lights=this.pairState&&(flight||chase)&&this.sunOnVehicle<.5;
+    document.getElementById('missionScale').textContent=(pad?this.t('msc.pad'):ocean?this.t('msc.ocean'):local?this.t(sample.config==='ascent'?'msc.localAscent':'msc.local'):flight?this.t(sample.phase==='ascent'?'msc.climb':'msc.approach'):coast?this.t(`msc.${coast}${this.coastNow.body}`):chase?this.t(this.pairState?.status==='rendezvous'?'msc.rendezvous':earthSide?'msc.chaseEarth':'msc.chaseMoon'):sample.orbit?this.t('msc.orbit'):this.t('msc.space'))+(lights?` · ${this.t('msc.lights')}`:'')+(dark?` · ${this.t('light.reading')}`:'')+(night?` · ${this.t('msc.night')}`:'');
   }
+  // The pair's bodies in the vehicle frame and, when one is too far to resolve, its point of light: sunlit metal
+  // (brighter as the range closes, by the inverse square) or, on the night side, only its flashing light.
+  updatePair(scale,trueSize){
+    const S=this.pairState,glints=this.glints;
+    if(!S){glints.lm.visible=glints.csm.visible=false;this.vehicleFar=0;return;}
+    // Offsets in true metres (scene units are 1000 km): when the wide views enlarge the vehicle, the pair grows as one.
+    const origin=this.vehicle.group.position,toBody=1e6,cam=this.camera.position,pxPerRad=this.container.clientHeight/THREE.MathUtils.degToRad(this.camera.fov);
+    const px=(p,metres)=>metres*1e-6/Math.max(p.distanceTo(cam),1e-12)*pxPerRad;
+    const lmPx=px(S.lm,4.5),csmPx=px(S.csm,11),close=S.lm.distanceTo(S.csm)<5e-5,lit=this.sunOnVehicle,time=performance.now()/1000;
+    this.vehicle.pair({lm:S.lm.clone().sub(origin).multiplyScalar(toBody),csm:S.csm.clone().sub(origin).multiplyScalar(toBody),lmQ:S.lmQ,csmQ:S.csmQ,
+      showLm:trueSize?lmPx>1:true,showCsm:trueSize?csmPx>1:close,time,sunlit:lit,rcs:S.rcs});
+    const flash=phase=>{const f=(((time+phase)%1)+1)%1;return f<.12?Math.exp(-f*30):0;},earth=this.earthshineLight.intensity/3.2;
+    for(const [name,p,size,phase,reach] of [['csm',S.csm,csmPx,.47,60],['lm',S.lm,lmPx,0,25]]){
+      const g=glints[name],km=Math.max(p.distanceTo(cam)*1000,1e-6),fade=1-ramp(2,7,size),near=Math.min(1,(reach/km)**2);
+      const level=trueSize?fade*((lit+(1-lit)*earth)*near+(1-lit)*flash(phase)*Math.min(1,(reach*.5/km)**2)):0;
+      g.visible=level>.002&&!this.behindMoon(p);if(g.visible){g.position.copy(p);g.material.color.setScalar(6*level);}
+    }
+    this.vehicleFar=trueSize?Math.max(S.lm.distanceTo(cam),S.csm.distanceTo(cam))*1.3:0;
+  }
+  // Is a point hidden from the camera by the Moon's disc?
+  behindMoon(p){
+    const c=this.camera.position,d=p.clone().sub(c),L=d.length();d.divideScalar(L||1);
+    const m=this.moon.position.clone().sub(c),tc=m.dot(d),r=RADIUS_KM/1000;
+    return tc>0&&tc<L&&m.lengthSq()-tc*tc<r*r;
+  }
+  // Does the ray from a point along a unit direction meet the Moon?
+  rayHitsMoon(from,dir){const m=this.moon.position.clone().sub(from),tc=m.dot(dir),r=RADIUS_KM/1000;return tc>0&&m.lengthSq()-tc*tc<r*r;}
   orbitForPhase(sample){
     if(['earthOrbit','tli'].includes(sample.phase))return this.plan.earthParking;
     if(['loi','lunarOrbit'].includes(sample.phase))return this.plan.lunarParking;
@@ -457,15 +522,50 @@ export class MissionScene {
     // High up, the camera rises above the lander and looks down, so the ground fills the background; the distance
     // stays short enough for a 7 m lander to read.
     const across=Math.hypot(view.x,view.z),elevation=THREE.MathUtils.degToRad(9.4+Math.min(30,sample.altitudeKm*3));view.y=across*Math.tan(elevation);
-    const target=this.vehicle.group.position.clone(),offset=this.convertView(view,sample,false,true).normalize().multiplyScalar((.04+Math.min(.04,sample.altitudeKm*.004))/1000);
+    // (The 3.8 m ascent stage is filmed closer than the 7 m lander coming down.)
+    const reach=sample.phase==='ascent'?.03+Math.min(.015,sample.altitudeKm*.002):.04+Math.min(.04,sample.altitudeKm*.004);
+    const target=this.vehicle.group.position.clone(),offset=this.convertView(view,sample,false,true).normalize().multiplyScalar(reach/1000);
     return {position:target.clone().add(offset),target,up:this.convertView(Y,sample,false,true).normalize()};
+  }
+  // The automatic camera beside the spacecraft. On the climb from the Moon it swings from above the ascent stage (the
+  // ground filling the background) to over its shoulder, toward the CSM, by ~40 km up; the rendezvous has its own shots.
+  autoPose(sample,flight){
+    if(flight)return this.pairState?orbitBlend(this.flightCameraPose(sample),this.pairPose(sample),ramp(6,40,sample.altitudeKm)):this.flightCameraPose(sample);
+    return this.pairState?this.pairPose(sample):this.chasePose(sample);
+  }
+  // The rendezvous, filmed round a pivot. While the CSM is far: the pivot 20 m ahead of the ascent stage and the camera
+  // over its shoulder, the view splitting the angle between the CSM above and the horizon below, so the CSM (a point,
+  // then a shape) grows ahead with the Moon in frame. From ~120 m to ~25 m the camera swings out beside the pair, the
+  // pivot between them, far enough to hold both for the contact; then it circles the docked stack slowly, follows the
+  // CSM after the jettison and eases into the ordinary chase framing the injection burn continues with. Up is the local
+  // vertical, so the horizon stays level.
+  pairPose(sample){
+    const S=this.pairState,M=1e-6,up=this.vehicle.group.position.clone().sub(this.moon.position),r=up.length();up.normalize();
+    const lmC=S.lm.clone().addScaledVector(S.lmAtt,1.4*M),los=S.csm.clone().sub(lmC).normalize();
+    const motion=v(sample.direction).normalize(),along=los.clone().addScaledVector(up,-los.dot(up));
+    if(along.lengthSq()<1e-6)along.copy(motion).addScaledVector(up,-motion.dot(up));along.normalize();
+    const side=new THREE.Vector3().crossVectors(along,up).normalize();
+    const R=RENDEZVOUS,t=sample.t,orbiting=sample.phase==='lunarReturnOrbit',docked=orbiting&&t>=R.contact,gap=docked?0:Math.max(S.gapKm*1000,0);
+    const k=docked?1:ramp(-Math.log(120),-Math.log(25),-Math.log(Math.max(gap,.01)));
+    const elevation=Math.asin(THREE.MathUtils.clamp(los.dot(up),-1,1)),dip=Math.acos(THREE.MathUtils.clamp(RADIUS_KM/1000/r,-1,1));
+    const tilt=THREE.MathUtils.clamp((elevation-dip)/2,-.5,.5),ahead=along.clone().multiplyScalar(Math.cos(tilt)).addScaledVector(up,Math.sin(tilt));
+    // Far: the camera 23 m behind the ascent stage, 7.4 m to the side and 4.6 m up, looking straight along `ahead` (so
+    // the stage sits low and to one side of the frame, the CSM above the centre, the horizon below it).
+    const far=lmC.clone().addScaledVector(ahead,20*M).addScaledVector(side,7.4*M).addScaledVector(up,4.6*M);
+    const pivot=far.lerp(lmC.clone().addScaledVector(los,Math.min(gap+7.5,40)/2*M),k);
+    if(orbiting)pivot.lerp(S.csm,ramp(R.jettison,R.separated+.06,t));
+    const beside=side.clone().addScaledVector(up,.3).addScaledVector(along,-.2).normalize().applyAxisAngle(up,docked?.9*(t-R.contact):0);
+    const distance=Math.exp(THREE.MathUtils.lerp(Math.log(43),Math.log(THREE.MathUtils.clamp(1.3*(gap+16),24,70)),k))*M;
+    let pose={position:pivot.clone().addScaledVector(slerpDir(ahead.clone().negate(),beside,k),distance),target:pivot,up};
+    if(orbiting&&t>R.turned)pose=orbitBlend(pose,this.chasePose(sample),ramp(R.turned,.97,t));
+    return pose;
   }
   // Beside and a little above the spacecraft, the horizon of the nearer body level behind it; drifts slowly around.
   chasePose(sample){
     const at=this.vehicle.group.position.clone(),centre=this.nearEarth(sample)?new THREE.Vector3():this.moon.position;
     const radial=at.clone().sub(centre).normalize(),motion=v(sample.direction).normalize();
     const side=new THREE.Vector3().crossVectors(motion,radial);if(side.lengthSq()<1e-4)side.crossVectors(radial,Math.abs(radial.y)<.9?Y:new THREE.Vector3(1,0,0));side.normalize();
-    const forward=new THREE.Vector3().crossVectors(radial,side).normalize(),wanted=Math.max(.022,this.vehicle.height*(this.vehicle.name==='rendezvous'?1.9:3.1));
+    const forward=new THREE.Vector3().crossVectors(radial,side).normalize(),wanted=Math.max(.022,this.vehicle.height*3.1);
     this.chaseD=this.chaseD?this.chaseD+(wanted-this.chaseD)*.14:wanted;
     const entry=sample.phase==='arrival',swing=(sample.t-.5)*(entry?.5:1.1);
     const offset=forward.multiplyScalar(entry?-.2:-.5).addScaledVector(side,entry?1:.85).addScaledVector(radial,entry?.22:.3).normalize().applyAxisAngle(radial,swing).multiplyScalar(this.chaseD*.001);
@@ -493,14 +593,14 @@ export class MissionScene {
     else if(local){const at=target||this.localVehicle.group.position.clone().add(new THREE.Vector3(0,.004,0));this.controls.target.copy(at);this.camera.position.copy(at).add(this.conditions?sideLitView(this.conditions.sun.direction):LOCAL_VIEW);this.lastPosition=at.clone();}
     else if(this.mode==='auto'&&coast){this.camera.position.copy(coast.position);this.controls.target.copy(coast.target);this.camera.up.copy(coast.up);this.lastPosition=null;}
     else if(this.mode==='auto'&&chase){
-      this.chaseD=0;const pose=this.chasePose(sample);this.camera.position.copy(pose.position);this.controls.target.copy(pose.target);this.camera.up.copy(pose.up);this.lastPosition=pose.target.clone();
+      this.chaseD=0;const pose=this.autoPose(sample,false);this.camera.position.copy(pose.position);this.controls.target.copy(pose.target);this.camera.up.copy(pose.up);this.lastPosition=this.vehicle.group.position.clone();
     }
     else if(this.mode==='overview'||['outbound','inbound'].includes(sample.phase)&&this.mode==='auto'){
       const center=this.bounds.center,distance=this.bounds.radius/Math.sin(THREE.MathUtils.degToRad(this.camera.fov/2))*1.12/Math.min(this.camera.aspect,1),axis=space(this.plan.outboundCurve[3]).normalize();
       const offset=new THREE.Vector3().crossVectors(axis,Y);if(offset.length()<.1)offset.set(0,0,1);offset.normalize().add(new THREE.Vector3(0,.6,0)).normalize();
       this.controls.target.copy(center);this.camera.position.copy(center).add(offset.multiplyScalar(distance));this.lastPosition=null;
     }else if(this.mode==='auto'&&flight){
-      const pose=this.flightCameraPose(sample);this.camera.position.copy(pose.position);this.controls.target.copy(pose.target);this.camera.up.copy(pose.up);this.lastPosition=pose.target.clone();
+      const pose=this.autoPose(sample,true);this.camera.position.copy(pose.position);this.controls.target.copy(pose.target);this.camera.up.copy(pose.up);this.lastPosition=this.vehicle.group.position.clone();
     }else{
       const at=this.vehicle.group.position.clone(),up=v(sample.direction).normalize(),side=new THREE.Vector3().crossVectors(up,Y);if(side.length()<.01)side.set(1,0,0);side.normalize();const distance=12;
       this.controls.target.copy(at);this.camera.position.copy(at).add(up.clone().multiplyScalar(distance*.45)).add(side.multiplyScalar(distance));this.lastPosition=at.clone();
@@ -511,7 +611,8 @@ export class MissionScene {
   updateCameraFX(){
     const fx=this.fx,world=this.world.visible,local=this.local.visible&&this.conditions&&this.sample;
     fx.sun.visible=world||Boolean(local);fx.setFixedExposure(this.pad.group.visible||this.oceanGroup.visible?1:null);
-    const diagram=world&&!this.closeView;fx.params.stars=diagram?DIAGRAM_STARS:1;fx.params.milkyWay=diagram?DIAGRAM_MILKY_WAY:1;fx.params.maxEV=diagram?20:CLOSE_MAX_EV;
+    const diagram=world&&!this.closeView,lunarNight=world&&this.closeView&&this.sample&&!this.nearEarth(this.sample)&&this.sunOnVehicle<.5;
+    fx.params.stars=diagram?DIAGRAM_STARS:1;fx.params.milkyWay=diagram?DIAGRAM_MILKY_WAY:1;fx.params.maxEV=diagram?20:lunarNight?LUNAR_NIGHT_EV:CLOSE_MAX_EV;
     if(local){
       const b=siteBasis(this.plan.site),f=this.sample.frame;
       fx.setSkyRows(toInertial(b.east,f),toInertial(b.up,f),toInertial(b.north,f).map(x=>-x));
@@ -526,13 +627,15 @@ export class MissionScene {
   // up in a frame of its own, and the Earth shader's 8k variant compiles in parallel beforehand, so nothing stalls.
   load8k(){
     const bitmaps=new THREE.ImageBitmapLoader().setOptions({imageOrientation:'flipY',premultiplyAlpha:'none',colorSpaceConversion:'none'});
-    const r=this.renderer,anisotropy=r.capabilities.getMaxAnisotropy();
-    const load=(file,srgb,single)=>new Promise((ok,ko)=>bitmaps.load(asset(`./assets/mission/${file}`),bitmap=>{
+    // The Earth's maps get the anisotropy earth-render's setMaps gives them (8), so swapping them in changes nothing that
+    // would send them to the GPU a second time.
+    const r=this.renderer,max=r.capabilities.getMaxAnisotropy();
+    const load=(file,srgb,single,anisotropy=Math.min(8,max))=>new Promise((ok,ko)=>bitmaps.load(asset(`./assets/mission/${file}`),bitmap=>{
       const t=new THREE.Texture(bitmap);t.flipY=false;t.colorSpace=srgb?THREE.SRGBColorSpace:THREE.NoColorSpace;t.anisotropy=anisotropy;t.wrapS=THREE.RepeatWrapping;
       if(single)t.format=THREE.RedFormat; // R8: a quarter of the memory and of the upload time; the shader reads .r
       t.needsUpdate=true;this.uploads.push(()=>{if(this.disposed){t.dispose();return;}r.initTexture(t);ok(t);});
     },undefined,ko));
-    return Promise.all([load('earth-day-8k.jpg',true),load('earth-night-8k.jpg',true),load('earth-clouds-8k.jpg',false,true),load('earth-water-8k.png',false,true),load('moon-color-8k.jpg',true),this.warmEarth8k()]);
+    return Promise.all([load('earth-day-8k.jpg',true),load('earth-night-8k.jpg',true),load('earth-clouds-8k.jpg',false,true),load('earth-water-8k.png',false,true),load('moon-color-8k.jpg',true,false,max),this.warmEarth8k()]);
   }
   // The Earth shader with the cloud and water maps, compiled ahead (in parallel where the browser offers it) into the
   // target the bodies are drawn to: tone mapping and output colour space are part of the program.

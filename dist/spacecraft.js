@@ -1179,7 +1179,29 @@ function buildChutes(m) {
   g.userData = { mains, drogues, rig }; return g;
 }
 
-const HEIGHT = { saturnV: 110.6, stage2: 80, sivb: 34, stack: 18, lm: 7, ascent: 3.8, csmAscent: 15, rendezvous: 22, csm: 11, cm: 3.5, cmChutes: 50 };
+const HEIGHT = { saturnV: 110.6, stage2: 80, sivb: 34, stack: 18, lm: 7, ascent: 3.8, csm: 11, cm: 3.5, cmChutes: 50 };
+
+// A soft white point (beacon flashes, distant spacecraft).
+let glow = null;
+export function glowTexture() {
+  if (glow) return glow;
+  const c = document.createElement('canvas'); c.width = c.height = 64; const g = c.getContext('2d'), r = g.createRadialGradient(32, 32, 0, 32, 32, 32);
+  r.addColorStop(0, 'rgba(255,255,255,1)'); r.addColorStop(.18, 'rgba(255,255,255,.55)'); r.addColorStop(.5, 'rgba(255,255,255,.08)'); r.addColorStop(1, 'rgba(255,255,255,0)');
+  g.fillStyle = r; g.fillRect(0, 0, 64, 64); glow = new THREE.CanvasTexture(c); glow.colorSpace = THREE.SRGBColorSpace; return glow;
+}
+// RCS exhaust: a short, widening cone from the nozzle, seen only where the Sun lights it (level 0..1).
+const JET = new THREE.CylinderGeometry(0.3, 0.035, 1.2, 12, 1, true).translate(0, 0.6, 0);
+function rcsJet() {
+  return new THREE.Mesh(JET, new THREE.ShaderMaterial({
+    uniforms: { uLevel: { value: 0 } }, transparent: true, depthWrite: false, side: THREE.DoubleSide, blending: THREE.AdditiveBlending,
+    vertexShader: 'varying float vY;void main(){vY=uv.y;gl_Position=projectionMatrix*modelViewMatrix*vec4(position,1.);}',
+    fragmentShader: 'uniform float uLevel;varying float vY;void main(){float a=uLevel*(1.-vY)*(1.-vY);gl_FragColor=vec4(vec3(1.5,1.52,1.6)*a,1.);}'
+  }));
+}
+function flashLight(scale) {
+  const s = new THREE.Sprite(new THREE.SpriteMaterial({ map: glowTexture(), color: new THREE.Color(7, 7, 7), transparent: true, opacity: 0, depthWrite: false, blending: THREE.AdditiveBlending }));
+  s.scale.setScalar(scale); return s;
+}
 
 // One vehicle that switches configuration with the mission phase.
 export class Spacecraft {
@@ -1189,23 +1211,21 @@ export class Spacecraft {
     cfg.saturnV = buildSaturnV(m, { stage: 1 }); cfg.stage2 = buildSaturnV(m, { stage: 2 }); cfg.sivb = buildSaturnV(m, { stage: 3 });
     for (const [k, model] of [['saturnV', cfg.saturnV], ['stage2', cfg.stage2], ['sivb', cfg.sivb]]) { const h = model.userData.height; model.position.y = -h * 0.45; }
     // Docked: the lunar module nose to nose with the command module, as after transposition and docking.
-    const apex = nasa ? nasa.csm.apex + 0.15 : 3.6, lmDock = nasa ? nasa.lm.deck + nasa.lm.dock : 6.0, ascDock = nasa ? nasa.lm.dock : 3.1;
+    const apex = nasa ? nasa.csm.apex + 0.15 : 3.6, lmDock = nasa ? nasa.lm.deck + nasa.lm.dock : 6.0;
     const stack = new THREE.Group(), csm1 = buildCSM(m, nasa), lm1 = buildLM(m, nasa); stack.add(csm1); lm1.rotation.x = Math.PI; lm1.position.y = apex + lmDock; stack.add(lm1); stack.position.y = -2; stack.userData.plume = csm1.userData.plume; cfg.stack = stack;
     cfg.lm = buildLM(m, nasa);
     cfg.ascent = buildAscentStage(m, nasa);
-    const csmA = new THREE.Group(), csm2 = buildCSM(m, nasa), asc = buildAscentStage(m, nasa); asc.rotation.x = Math.PI; asc.position.y = apex + ascDock; csmA.add(csm2, asc); csmA.userData.plume = csm2.userData.plume; cfg.csmAscent = csmA;
     cfg.csm = buildCSM(m, nasa);
-    // Rendezvous: the ascent stage closing on the CSM nose to nose, its docking tunnel on the CSM's probe. Braking jets:
-    // the four RCS quads fire toward the CSM in short bursts at the range gates (a white puff each, gone in ~0.3 s).
-    const rv = new THREE.Group(), csm3 = buildCSM(m, nasa), asc3 = buildAscentStage(m, nasa); asc3.rotation.x = Math.PI; rv.add(csm3, asc3);
-    const puffMap = (() => { const c = document.createElement('canvas'); c.width = c.height = 64; const g = c.getContext('2d'), r = g.createRadialGradient(32, 32, 0, 32, 32, 32);
-      r.addColorStop(0, 'rgba(255,255,255,.95)'); r.addColorStop(.35, 'rgba(235,240,250,.35)'); r.addColorStop(1, 'rgba(235,240,250,0)'); g.fillStyle = r; g.fillRect(0, 0, 64, 64); const t = new THREE.CanvasTexture(c); t.colorSpace = THREE.SRGBColorSpace; return t; })();
-    const puffs = [];
-    for (const [x, z] of [[1.65, 1.65], [-1.65, 1.65], [1.65, -1.65], [-1.65, -1.65]]) {
-      const sprite = new THREE.Sprite(new THREE.SpriteMaterial({ map: puffMap, transparent: true, depthWrite: false, opacity: 0, blending: THREE.AdditiveBlending }));
-      sprite.position.set(x, 3.3, z); sprite.scale.setScalar(1.4); asc3.add(sprite); puffs.push(sprite);
-    }
-    rv.userData = { plume: csm3.userData.plume, ascent: asc3, dockY: apex + ascDock, puffs }; cfg.rendezvous = rv;
+    // The lunar rendezvous: the ascent stage and the CSM as two bodies, placed by pair() from the mission model (from
+    // the climb to orbit to the injection burn: the approach, the docking, the docked stack, the jettison).
+    // Lights for the night side: the LM's tracking light on its front face, the CSM's rendezvous beacon on the service
+    // module (one each side), both flashing about once a second. The four RCS quads' upward jets brake toward the CSM.
+    const pair = new THREE.Group(), lmP = buildAscentStage(m, nasa), csmP = buildCSM(m, nasa); pair.add(lmP, csmP);
+    const tracking = flashLight(0.9); tracking.position.set(0, nasa ? 2.62 : 2.3, nasa ? 2.27 : 1.13); lmP.add(tracking);
+    const beacons = [1, -1].map(s => { const b = flashLight(1.1); b.position.set(0, -0.55, s * 2.0); csmP.add(b); return b; });
+    const quad = nasa ? [1.73, 1.3, 1.73] : [1.62, 2.13, 1.08];
+    const jets = [[1, 1], [-1, 1], [1, -1], [-1, -1]].map(([x, z]) => { const j = rcsJet(); j.position.set(quad[0] * x, quad[1], quad[2] * z); lmP.add(j); return j; });
+    pair.userData = { plume: lmP.userData.plume, lm: lmP, csm: csmP, tracking, beacons, jets }; cfg.pair = pair; this.span = 6;
     // Entry: the capsule's own heat shield glows (a material of its own), wrapped in the plasma.
     const cm = buildCM(m, {}, nasa); cm.position.y = -1.5;
     const shield = cm.children.find(c => c.userData.shield); if (shield) shield.material = m.heatShield.clone();
@@ -1216,17 +1236,18 @@ export class Spacecraft {
     this.context = { altitudeKm: 0, sunlit: true, groundKm: null }; this.plasmaContext = {};
     this.name = null; this.set('lm');
   }
-  get height() { return HEIGHT[this.name] / 1000; }
-  // k: 0..1 through the final approach. Range from 45 m to contact, slowing as flown (braking gates at ~30, 15 and
-  // 5 m, then ~0.1 m/s), a lateral offset taken out on the way and a little attitude hold wander; contact at k = 1.
-  rendezvous(k, time = performance.now() / 1000) {
-    const rv = this.configs.rendezvous, asc = rv.userData.ascent, c = Math.min(1, Math.max(0, k)), e = 1 - Math.pow(1 - c, 2.2);
-    const range = 45 * (1 - e), side = 12 * Math.pow(1 - e, 1.6), wander = 1 - e;
-    asc.position.set(side, rv.userData.dockY + range, -.45 * side);
-    asc.rotation.set(Math.PI + .06 * wander * Math.sin(time * .9), .35 * wander, .05 * wander * Math.sin(time * .6));
-    const gate = g => Math.max(0, 1 - Math.abs(c - g) / .025);
-    const burst = Math.max(gate(.42), gate(.66), gate(.84), gate(.95)) * (.6 + .4 * Math.sin(time * 37) ** 2);
-    for (const p of rv.userData.puffs) p.material.opacity = .9 * burst;
+  get height() { return (this.name === 'pair' ? this.span : HEIGHT[this.name]) / 1000; }
+  // The rendezvous pair: each body's position (metres, in the vehicle's frame, which stays unrotated for this
+  // configuration) and world rotation; the flashing lights (much fainter against sunlight), the RCS level (seen only in
+  // sunlight), and what the shadow box and the framing must hold (both bodies while they are within ~40 m).
+  pair({ lm, csm, lmQ, csmQ, showLm = true, showCsm = true, time = performance.now() / 1000, sunlit = 1, rcs = 0 }) {
+    const P = this.configs.pair.userData;
+    P.lm.position.copy(lm); P.lm.quaternion.copy(lmQ); P.lm.visible = showLm;
+    P.csm.position.copy(csm); P.csm.quaternion.copy(csmQ); P.csm.visible = showCsm;
+    const flash = phase => { const f = (((time + phase) % 1) + 1) % 1; return f < 0.12 ? Math.exp(-f * 30) : 0; }, night = 1 - 0.85 * sunlit;
+    P.tracking.material.opacity = flash(0) * night; for (const b of P.beacons) b.material.opacity = flash(0.47) * night;
+    P.jets.forEach((j, i) => { j.material.uniforms.uLevel.value = rcs * sunlit * (0.8 + 0.2 * Math.sin(time * 53 + i * 1.7)); });
+    const d = lm.distanceTo(csm); this.span = showCsm && d < 40 ? Math.max(8, d + 12) : 6;
   }
   // Where the ascent stage sits on the descent stage, km.
   get ascentBase() { return (this.nasa ? this.nasa.lm.deck : 3.15) / 1000; }

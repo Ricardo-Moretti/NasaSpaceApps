@@ -253,6 +253,7 @@ input[type="range"]::-moz-range-thumb { width: 12px; height: 24px; border-radius
 .helmet-ghost { position: absolute; width: 7%; aspect-ratio: 1; border-radius: 50%; transform: translate(-50%, -50%); background: radial-gradient(circle, rgba(255, 228, 176, .22), rgba(255, 228, 176, .06) 55%, rgba(255, 228, 176, 0) 72%); opacity: 0; mix-blend-mode: screen; }
 .helmet-visor { position: absolute; inset: 0; background: rgb(150, 142, 84); mix-blend-mode: multiply; opacity: 0; transition: opacity .7s var(--ease); }
 .helmet.visor .helmet-visor { opacity: .9; }
+.scene-fade { position: absolute; inset: 0; z-index: 1; background: #000; opacity: 0; pointer-events: none; }
 .walk-hud { position: absolute; left: 0; top: 0; z-index: 2; display: grid; gap: 8px; justify-items: center; max-width: min(560px, calc(100% - 24px)); pointer-events: none; }
 .walk-hud[hidden] { display: none; }
 .walk-info { margin: 0; padding: 6px 12px; border-radius: 999px; background: rgba(10, 10, 12, .72); color: var(--text); font-size: 13.5px; line-height: 1.3; text-align: center; backdrop-filter: blur(8px); }
