@@ -6,7 +6,7 @@ import { lunarMaterial, regolithNormalMap, detailedTerrainGeometry, contextTerra
 import { loadStarCatalog } from './stars.js';
 import { createEarthRenderer } from './earth-render.js';
 import { createOcean } from './ocean.js';
-import { CameraFX } from './camera-fx.js';
+import { CameraFX, EYE_STARS } from './camera-fx.js';
 import { Spacecraft, createMaterials, makeEnvironment, buildDescentStage, buildSpent, setLayer, glowTexture } from './spacecraft.js';
 import { LandingSite } from './landing-site.js';
 import { LaunchPad, PAD_DECK } from './launch-pad.js';
@@ -33,8 +33,9 @@ const SPIN=new THREE.Quaternion().setFromAxisAngle(Y,.6); // the capsule's headi
 // reads as ashen light, as in the photographs; on the ground it stays physical.
 const EARTHSHINE_BOOST=400;
 // The trajectory diagrams show the sky as a long exposure (~20 stops): with the white paths in frame the camera stays
-// at EV 0 and the true starlight (Pogson, anchored on the Sun) would be black. Close views keep the true sky, and the
-// camera opens at most 3 stops there, so the night licences (city lights, airglow, earthshine) are not multiplied.
+// at EV 0 and the true starlight (Pogson, anchored on the Sun) would be black. Close views show the stars an eye would
+// (EYE_STARS), and the camera opens at most 1 stop there (4 on the lunar night side), so the night licences (city
+// lights, airglow, earthshine) are not multiplied.
 const DIAGRAM_STARS=2**20,DIAGRAM_MILKY_WAY=2**22,CLOSE_MAX_EV=1;
 // On the night side of the Moon the spacecraft have only the Earth's light (and their own flashing lights): there the
 // camera opens up to 4 stops, a long exposure, as night pictures are made; with the earthshine licence above, the
@@ -612,7 +613,8 @@ export class MissionScene {
     const fx=this.fx,world=this.world.visible,local=this.local.visible&&this.conditions&&this.sample;
     fx.sun.visible=world||Boolean(local);fx.setFixedExposure(this.pad.group.visible||this.oceanGroup.visible?1:null);
     const diagram=world&&!this.closeView,lunarNight=world&&this.closeView&&this.sample&&!this.nearEarth(this.sample)&&this.sunOnVehicle<.5;
-    fx.params.stars=diagram?DIAGRAM_STARS:1;fx.params.milkyWay=diagram?DIAGRAM_MILKY_WAY:1;fx.params.maxEV=diagram?20:lunarNight?LUNAR_NIGHT_EV:CLOSE_MAX_EV;
+    // Close views keep the stars an eye sees (EYE_STARS, camera-fx.js); the diagrams their long exposure.
+    fx.params.stars=diagram?DIAGRAM_STARS:EYE_STARS.stars;fx.params.starAdapt=diagram?1:EYE_STARS.starAdapt;fx.params.milkyWay=diagram?DIAGRAM_MILKY_WAY:1;fx.params.maxEV=diagram?20:lunarNight?LUNAR_NIGHT_EV:CLOSE_MAX_EV;
     if(local){
       const b=siteBasis(this.plan.site),f=this.sample.frame;
       fx.setSkyRows(toInertial(b.east,f),toInertial(b.up,f),toInertial(b.north,f).map(x=>-x));

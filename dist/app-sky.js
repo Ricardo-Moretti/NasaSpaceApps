@@ -4,7 +4,7 @@ import { EffectComposer } from 'three/addons/postprocessing/EffectComposer.js';
 import { Pass, FullScreenQuad } from 'three/addons/postprocessing/Pass.js';
 import { ShaderPass } from 'three/addons/postprocessing/ShaderPass.js';
 import { createEarthRenderer } from './earth-render.js';
-import { CameraFX, createSun } from './camera-fx.js';
+import { CameraFX, createSun, EYE_STARS } from './camera-fx.js';
 
 const BODY_DISTANCE = 1400, AU_KM = 149597870.7;
 // EV here is log2(radiance multiplier), not photographic EV100. No artificial night gain.
@@ -91,7 +91,7 @@ export class AppSky {
     }
     if (this.hdr) {
       this.fx = new CameraFX(renderer, { camera, initialEV: 0, sunOptions: { logarithmicDepthBuffer: log } });
-      Object.assign(this.fx.params, APP_EXPOSURE, { milkyWay: 0, flare: .65, glare: 1, spikes: .65, ghosts: .25, halo: .12, veil: .025 });
+      Object.assign(this.fx.params, APP_EXPOSURE, EYE_STARS, { milkyWay: 0, flare: .65, glare: 1, spikes: .65, ghosts: .25, halo: .12, veil: .025 });
       this.sun = this.fx.sun;
       // Geometry stays single-sampled: MSAA HDR targets multiply every post-pass bandwidth on ANGLE/iGPUs.
       this.composer = new EffectComposer(renderer, target(1, 1, true)); this.composer.setPixelRatio(1);

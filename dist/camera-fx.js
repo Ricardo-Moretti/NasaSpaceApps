@@ -29,6 +29,10 @@ const SUN_RGB = [1.097, 0.978, 0.935];
 // plane); 1 S10 = one 10th-mag star per square degree = 2.11e-11 in scene radiance. Sagittarius then comes out
 // ~1800 S10 (~19.8 mag/arcsec^2), the poles ~12 S10 (bright stars are left out of that map; they are drawn as points).
 export const MILKY_WAY_SCALE = 6.4e-8;
+// The stars as a dark-adapted eye sees them on the Moon (a stated licence, like the earthshine boost): 2^19.5 brings
+// Sirius from ~20 stops under sunlit regolith to just under it, and the faint ones to the edge of seeing; they follow
+// 0.3 of the exposure, so a dark view shows more of them, lit ground fewer, and the glare still hides them near the Sun.
+export const EYE_STARS = Object.freeze({ stars: 2 ** 19.5, starAdapt: .3 });
 
 // ---------------------------------------------------------------------------------------------------------------
 // Analytic geometry (CPU)
@@ -216,6 +220,10 @@ export class CameraFX {
       tauBright: 0.22, tauDark: 1.3, // adaptation time constants (s): fast when the scene brightens, slower when it darkens
       flare: 1, glare: 1, ghosts: 1, spikes: 1, halo: 1, veil: 1, blades, bladeAngle: 0.31,
       stars: 1, milkyWay: 1,
+      // How much of the exposure the stars follow: 1 = a camera (true ratios to sunlit surfaces); below 1, the eye. A
+      // dark-adapted eye does not take its stars ~20 stops down when lit ground is in view: with a stars gain (a stated
+      // licence) they stay on the black sky, brighter as the view darkens, and still go in the glare near the Sun.
+      starAdapt: 1,
       // Film saturation after exposure: the emulsion (or sensor) cannot record more than this, and the bloom pass
       // (UnrealBloom, made for highlights of ~1-10) would turn a 4000-bright disc into a screen-wide blob. The Sun's
       // real glare comes from the flare below, computed from its true flux.
@@ -372,13 +380,13 @@ export class CameraFX {
     // Stars: HYG catalogue points at true irradiance, PSF = Gaussian core + Moffat wing, drawn behind the scene.
     this.starScene = new THREE.Scene();
     this.starMaterial = new THREE.ShaderMaterial({
-      uniforms: { tState: { value: null }, uJ2000ToScene: { value: this.j2000ToScene }, uPx: { value: 1e-3 }, uSigma: { value: .6 }, uGain: { value: 1 } },
+      uniforms: { tState: { value: null }, uJ2000ToScene: { value: this.j2000ToScene }, uPx: { value: 1e-3 }, uSigma: { value: .6 }, uGain: { value: 1 }, uAdapt: { value: 1 } },
       vertexShader: /* glsl */`
-        attribute float aIrradiance; attribute vec3 aColor; uniform sampler2D tState; uniform mat3 uJ2000ToScene; uniform float uPx, uSigma, uGain;
+        attribute float aIrradiance; attribute vec3 aColor; uniform sampler2D tState; uniform mat3 uJ2000ToScene; uniform float uPx, uSigma, uGain, uAdapt;
         varying vec3 vColor; varying float vSize, vCore, vWing;
         const float HALO = .04, A = 1.6;   // wing energy fraction and Moffat core (px), beta = 1.5
         void main(){
-          float X = exp2(texture2D(tState, vec2(.5)).r) * uGain;
+          float X = exp2(texture2D(tState, vec2(.5)).r * uAdapt) * uGain;
           float flux = aIrradiance * X / (uPx * uPx);                       // radiance x pixels on the film
           vCore = flux * (1. - HALO) / (6.2832 * uSigma * uSigma); vWing = flux * HALO * .5 / (3.1416 * A * A);
           float t = 2e-4;                                                   // below this a pixel is black after tone mapping
@@ -497,7 +505,7 @@ class CameraFXPass extends Pass {
     a.uGlare.value = p.glare; a.uGhosts.value = p.ghosts; a.uSpikes.value = p.spikes; a.uHalo.value = p.halo; a.uVeil.value = p.veil; a.uBlades.value = p.blades; a.uBladeAngle.value = p.bladeAngle;
     q.material = fx.applyMaterial; renderer.setRenderTarget(this.renderToScreen ? null : writeBuffer); q.render(renderer);
     if (fx.stars && p.stars > 0) {
-      const s = fx.starMaterial.uniforms; s.tState.value = next.texture; s.uPx.value = pxAngle; s.uSigma.value = .6 * Math.max(1, renderer.getPixelRatio()); s.uGain.value = p.stars;
+      const s = fx.starMaterial.uniforms; s.tState.value = next.texture; s.uPx.value = pxAngle; s.uSigma.value = .6 * Math.max(1, renderer.getPixelRatio()); s.uGain.value = p.stars; s.uAdapt.value = p.starAdapt ?? 1;
       const layers = camera.layers.mask; camera.layers.enableAll(); renderer.render(fx.starScene, camera); camera.layers.mask = layers;
     }
     renderer.autoClear = autoClear;
