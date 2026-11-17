@@ -248,7 +248,7 @@ input[type="range"]::-moz-range-thumb { width: 12px; height: 24px; border-radius
 /* Caminhada na superfície: o capacete (por cima da cena, por baixo dos rótulos e painéis) e os controles. */
 .helmet { position: absolute; left: 0; top: 0; width: 100%; height: 100%; pointer-events: none; opacity: 0; transition: opacity .5s var(--ease); overflow: hidden; }
 .helmet.on { opacity: 1; }
-.helmet-frame { position: absolute; inset: 0; width: 100%; height: 100%; }
+.helmet-frame { position: absolute; left: 0; top: 0; width: 100%; height: 100%; overflow: visible; box-shadow: 0 0 0 300vmax #08090a; }
 .helmet-glare { position: absolute; width: 70%; aspect-ratio: 1; border-radius: 50%; transform: translate(-50%, -50%); background: radial-gradient(circle, rgba(255, 247, 228, .32), rgba(255, 240, 212, .1) 24%, rgba(255, 236, 200, 0) 62%); opacity: 0; mix-blend-mode: screen; }
 .helmet-ghost { position: absolute; width: 7%; aspect-ratio: 1; border-radius: 50%; transform: translate(-50%, -50%); background: radial-gradient(circle, rgba(255, 228, 176, .22), rgba(255, 228, 176, .06) 55%, rgba(255, 228, 176, 0) 72%); opacity: 0; mix-blend-mode: screen; }
 .helmet-visor { position: absolute; inset: 0; background: rgb(150, 142, 84); mix-blend-mode: multiply; opacity: 0; transition: opacity .7s var(--ease); }
@@ -297,6 +297,21 @@ input[type="range"]::-moz-range-thumb { width: 12px; height: 24px; border-radius
 .message.visible { opacity: 1; transform: translate(-50%, 0); pointer-events: auto; }
 .message.error { background: #ffd9e6; color: #44001a; }
 /* Short laptop screens: keep the whole answer column in view. */
+/* Short desktop windows (laptops at 125-150 % scaling, ~650-860 px tall). The panels float over a smaller scene, so it
+   keeps only what each view needs: the walk view drops the observer row, the colour key and the hints (the observer
+   height stays in the relief view), the walk controls fold into two rows and sit beside the tool row. */
+@media (min-width: 1181px) and (max-height: 860px) {
+  .viewport { min-height: 520px; }
+  .stage-title { top: 18px; left: 20px; }
+  .stage-title h1 { font-size: clamp(26px, 2.5vw, 38px); }
+  .stage-sub { margin: 4px 0 10px; }
+  #sceneBox[data-view="surface"] .stage-controls, #sceneBox[data-view="surface"] .stage-meta { display: none; }
+  .walk-hint { display: none; }
+  .walk-opts { max-width: 470px; }
+  .walk-hud { max-width: min(500px, calc(100% - 24px)); }
+  .walk-toggle { min-height: 32px; }
+  .console { padding: 12px 16px; gap: 10px; }
+}
 @media (min-width: 1181px) and (max-height: 800px) { .chart-read { display: none; } .answer-row + .answer-row { margin-top: 9px; padding-top: 9px; } .irradiance { margin-top: 8px; } }
 @media (min-width: 1181px) { .message { top: auto; bottom: calc(var(--console-h, 165px) + 92px); left: calc(50% - 175px); } }
 .message span { flex: 1; }

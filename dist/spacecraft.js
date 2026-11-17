@@ -25,7 +25,7 @@ function canvasTexture(w, h, draw, srgb = true) {
 }
 
 // Environment for metal: what a spacecraft reflects. Near the Moon: grey regolith below, black sky above.
-export function makeEnvironment(renderer, { sky = [0, 0, 0], ground = [0.34, 0.33, 0.31], horizon = null } = {}) {
+function environmentScene({ sky = [0, 0, 0], ground = [0.34, 0.33, 0.31], horizon = null, sun = true } = {}) {
   const scene = new THREE.Scene();
   const material = new THREE.ShaderMaterial({
     side: THREE.BackSide, depthWrite: false,
@@ -35,8 +35,29 @@ export function makeEnvironment(renderer, { sky = [0, 0, 0], ground = [0.34, 0.3
   });
   scene.add(new THREE.Mesh(new THREE.SphereGeometry(10, 48, 24), material));
   // A small bright patch where the Sun would be keeps highlights alive on polished surfaces.
-  const sun = new THREE.Mesh(new THREE.SphereGeometry(0.5, 16, 8), new THREE.MeshBasicMaterial({ color: new THREE.Color(6, 5.8, 5.4) }));
-  sun.position.set(6, 3, 5); scene.add(sun);
+  if (sun) { const patch = new THREE.Mesh(new THREE.SphereGeometry(0.5, 16, 8), new THREE.MeshBasicMaterial({ color: new THREE.Color(6, 5.8, 5.4) })); patch.position.set(6, 3, 5); scene.add(patch); }
+  return scene;
+}
+const disposeScene = scene => scene.traverse(o => { o.geometry?.dispose(); o.material?.dispose(); });
+// The shaders makeEnvironment's pass draws with (the surround, the Sun patch, PMREM's background box, its blur and GGX
+// filters at the default 256 px cube), compiled ahead in parallel (KHR_parallel_shader_compile): makeEnvironment draws
+// at once, and where each new shader's first draw waits for its compile (Windows, ANGLE) that froze the page ~1.4 s.
+// The programs live while a material holds them: dispose the handle only after makeEnvironment has run.
+export function warmEnvironment(renderer) {
+  const pmrem = new THREE.PMREMGenerator(renderer), scene = environmentScene(), flat = new THREE.Scene(), extra = [];
+  let ready = Promise.resolve();
+  const previous = renderer.getRenderTarget();
+  try {
+    pmrem._setSize(256); const target = pmrem._allocateTargets(); extra.push(target);
+    scene.add(new THREE.Mesh(new THREE.BoxGeometry(), new THREE.MeshBasicMaterial({ side: THREE.BackSide, depthWrite: false, depthTest: false })));
+    for (const m of [pmrem._blurMaterial, pmrem._ggxMaterial]) if (m) flat.add(new THREE.Mesh(new THREE.BufferGeometry(), m));
+    renderer.setRenderTarget(target); // drawn into a half-float target: linear output, no tone mapping
+    ready = Promise.all([renderer.compileAsync(scene, new THREE.PerspectiveCamera(90, 1, .1, 100)), renderer.compileAsync(flat, new THREE.OrthographicCamera())]);
+  } catch { /* compiled on first use instead */ } finally { renderer.setRenderTarget(previous); }
+  return { ready: ready.catch(() => {}), dispose() { disposeScene(scene); flat.traverse(o => o.geometry?.dispose()); extra.forEach(x => x.dispose()); pmrem.dispose(); } };
+}
+export function makeEnvironment(renderer, options = {}) {
+  const scene = environmentScene(options);
   const pmrem = new THREE.PMREMGenerator(renderer), previousClear = renderer.autoClear;
   const previousTarget = renderer.getRenderTarget(), previousFace = renderer.getActiveCubeFace(), previousMip = renderer.getActiveMipmapLevel();
   let target;
@@ -44,7 +65,7 @@ export function makeEnvironment(renderer, { sky = [0, 0, 0], ground = [0.34, 0.3
   try { renderer.autoClear = true; target = pmrem.fromScene(scene, 0.02); }
   finally {
     renderer.autoClear = previousClear; renderer.setRenderTarget(previousTarget, previousFace, previousMip);
-    pmrem.dispose(); material.dispose(); scene.traverse(o => { o.geometry?.dispose(); if (o.material && o.material !== material) o.material.dispose(); });
+    pmrem.dispose(); disposeScene(scene);
   }
   return target;
 }

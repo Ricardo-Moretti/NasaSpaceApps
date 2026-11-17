@@ -9,7 +9,7 @@ import { lunarMaterial, detailedTerrainGeometry, contextTerrainGeometry, innerTe
 import { TerrainLight, NEAR_SHADOW } from './terrain-light.js';
 import { LandingSite } from './landing-site.js';
 import { loadNasaModels } from './nasa-models.js';
-import { makeEnvironment, createMaterials, buildLM } from './spacecraft.js';
+import { makeEnvironment, warmEnvironment, createMaterials, buildLM } from './spacecraft.js';
 import { AppSky } from './app-sky.js';
 import { buildLMCabin } from './lm-cabin.js';
 
@@ -316,8 +316,9 @@ export class LunarScene {
     this.terrainMesh = new THREE.Mesh(detailedTerrainGeometry(terrain, { stride: this.lowPower ? 2 : 1 }), this.terrainMaterial);
     this.terrainMesh.castShadow = false; this.terrainMesh.receiveShadow = true;
     this.localGroup.add(this.terrainMesh);
-    if (this.innerMesh) { this.localGroup.remove(this.innerMesh); this.innerMesh.geometry.dispose(); this.innerMesh = null; }
-    const inner = innerTerrainGeometry(terrain, { stride: this.lowPower ? 2 : 1 });
+    if (this.innerMesh) { this.localGroup.remove(this.innerMesh); this.innerMesh = null; }
+    for (const g of [this.innerFull, this.innerHoled]) g?.dispose(); this.innerHoled = null;
+    const inner = this.innerFull = innerTerrainGeometry(terrain, { stride: this.lowPower ? 2 : 1 });
     if (inner) { this.innerMesh = new THREE.Mesh(inner, this.innerMaterial); this.innerMesh.castShadow = false; this.innerMesh.receiveShadow = true; this.localGroup.add(this.innerMesh); }
     const context = contextTerrainGeometry(terrain);
     if (context) {
@@ -328,8 +329,8 @@ export class LunarScene {
     this.horizonKey = '';
     if (this.landing) { this.localGroup.remove(this.landing.group); this.landing.dispose(); this.landing = null; }
     if (this.lander) { this.localGroup.remove(this.lander); this.lander = null; }
-    this.walker.x = this.walker.z = 0; this.walker.here = null; this.landWalker();
-    if (this.view === 'surface') this.ensureGround();
+    this.surfaceReady = false; this.walker.x = this.walker.z = 0; this.walker.here = null; this.landWalker();
+    if (this.view === 'surface') this.ensureGround(); else this.prepareSurface();
     // Rays and horizon need the terrain: refresh them now if directions already arrived.
     if (this.result) this.update(this.result, this.date, this.heightM, this.selected);
     this.resetCamera(); this.invalidate();
@@ -465,8 +466,15 @@ export class LunarScene {
     const surface = this.view === 'surface', atPoint = Math.hypot(this.walker.x, this.walker.z) < .001;
     this.horizonLine.visible = surface && atPoint && !this.walker.cabin;
     this.helmet.classList.toggle('on', surface && this.walker.helmet && !this.insideCabin()); this.helmet.classList.toggle('visor', this.walker.visor);
-    this.walkHud.hidden = !surface; this.astronaut.visible = surface && Boolean(this.landing) && !this.walker.cabin;
-    if (this.lander) this.lander.visible = surface && (this.walker.lander || this.walker.cabin);
+    // The detailed ground, the lander and the walker's body appear once their shaders are compiled (prepareSurface);
+    // the 40 m tile has a hole where that ground lies, only while it is shown.
+    const ready = surface && Boolean(this.landing) && this.surfaceReady;
+    this.walkHud.hidden = !surface; this.astronaut.visible = ready && !this.walker.cabin;
+    if (this.landing) this.landing.group.visible = ready;
+    if (this.lander) this.lander.visible = ready && (this.walker.lander || this.walker.cabin);
+    if (this.innerMesh) { const g = ready && this.innerHoled || this.innerFull; if (g && this.innerMesh.geometry !== g) this.innerMesh.geometry = g; }
+    const preparing = surface && !ready;
+    if (preparing !== (this.walkHud.dataset.state === 'preparing')) { if (preparing) this.walkHud.dataset.state = 'preparing'; else delete this.walkHud.dataset.state; this.walkTexts(); }
     if (surface) this.ensureGround();
     this.paths.visible = local && !this.telephoto && !this.walker.cabin;
     for (const p of this.sitePins) { p.pin.visible = local && p.shown && !this.telephoto; p.link.visible = this.view === 'terrain' && p.shown; }
@@ -563,8 +571,10 @@ export class LunarScene {
       const label = document.getElementById(`${body}Label`); if (!label) continue;
       // Their numbers belong to the reference point: away from it, the walk panel says what is in view.
       if (!local || !this.result || this.telephoto || away) { label.style.opacity = '0'; continue; }
-      const p = this.project(this[body].position);
-      label.style.opacity = p.visible ? '1' : '0'; label.style.transform = `translate(${p.x + 14}px,${p.y - 14}px)`;
+      // Hidden where it would slip under the walk controls (half a label peeking out beside them).
+      const p = this.project(this[body].position), x = p.x + 14, y = p.y - 14, hb = this.hudBox;
+      const under = hb && x < hb[0] + hb[2] && x + (label.offsetWidth || 160) > hb[0] && y < hb[1] + hb[3] && y + 28 > hb[1];
+      label.style.opacity = p.visible && !under ? '1' : '0'; label.style.transform = `translate(${x}px,${y}px)`;
     }
     ['sun', 'earth'].forEach((body, i) => {
       const el = this.blockLabels[i], state = this.rays[body].state;
@@ -624,7 +634,7 @@ export class LunarScene {
   // 40 m tile gets a hole where it lies.
   ensureGround() {
     if (this.landing || this.groundPending || !this.terrain) return;
-    this.groundPending = true; this.walkHud.dataset.state = 'preparing'; this.walkTexts();
+    this.groundPending = true;
     setTimeout(() => {
       this.groundPending = false; if (this.disposed || !this.terrain || this.landing) return;
       const terrain = this.terrain, space = siteSpace(siteBasis(terrain.site), RADIUS_KM + terrain.elevationKm - terrain.height(0, 0));
@@ -633,11 +643,8 @@ export class LunarScene {
       this.landing.group.traverse(o => { if (o.isMesh || o.isInstancedMesh) { o.castShadow = o !== this.landing.mesh && !o.userData.groundFillet; o.receiveShadow = true; for (const m of Array.isArray(o.material) ? o.material : [o.material]) this.groundLight.attach(m); } });
       this.groundLight.setLanding(this.landing);
       this.localGroup.add(this.landing.group);
-      if (this.innerMesh) {
-        const inner = innerTerrainGeometry(terrain, { stride: this.lowPower ? 2 : 1, hole: this.landing.half });
-        if (inner) { this.innerMesh.geometry.dispose(); this.innerMesh.geometry = inner; }
-      }
-      delete this.walkHud.dataset.state; this.landLander();
+      if (this.innerMesh) this.innerHoled = innerTerrainGeometry(terrain, { stride: this.lowPower ? 2 : 1, hole: this.landing.half });
+      this.landLander();
       if (this.view === 'surface') { this.placeWalker(true); this.checkHere(true); }
       if (this.result) this.applyLights();
       this.applyView(); this.walkTexts(); this.invalidate();
@@ -648,12 +655,18 @@ export class LunarScene {
   landLander() {
     if (this.lander || this.landerPending || !this.landing) return;
     this.landerPending = true;
-    loadNasaModels().then(nasa => {
-      this.landerPending = false; if (this.disposed || !this.landing || this.lander) return;
-      if (!this.landerMaterials) { this.landerEnv = makeEnvironment(this.renderer, { ground: [.34, .33, .31] }); this.landerMaterials = createMaterials(this.landerEnv.texture); this.landerMaterials.onTextureLoad = () => this.invalidate(); }
+    const warm = this.landerMaterials ? null : warmEnvironment(this.renderer);
+    Promise.all([loadNasaModels(), warm?.ready]).then(async ([nasa]) => { if (this.view !== 'surface') await this.whenQuiet(); return nasa; }).then(nasa => {
+      this.landerPending = false; if (this.disposed || !this.landing || this.lander) { warm?.dispose(); return; }
+      if (!this.landerMaterials) {
+        this.landerEnv = makeEnvironment(this.renderer, { ground: [.34, .33, .31] }); this.landerMaterials = createMaterials(this.landerEnv.texture); this.landerMaterials.onTextureLoad = () => this.invalidate();
+        // The cabin's surround: the floods bouncing off the light walls (bright above, the darker floor below).
+        this.cabinEnv = makeEnvironment(this.renderer, { sky: [.254, .271, .254], horizon: [.147, .159, .15], ground: [.048, .051, .05], sun: false });
+      }
+      warm?.dispose();
       const lm = buildLM(this.landerMaterials, nasa);
       // The crew cabin (lm-cabin.js), inside the ascent stage, for 'Enter the lander'.
-      this.cabin = buildLMCabin({ exterior: lm, worldScale: .001 }); this.cabin.group.visible = false; lm.add(this.cabin.group);
+      this.cabin = buildLMCabin({ exterior: lm, worldScale: .001, ambient: this.cabinEnv?.texture }); this.cabin.group.visible = false; lm.add(this.cabin.group);
       this.cabin.lights = []; this.cabin.group.traverse(o => { if (o.isLight) { this.cabin.lights.push([o, o.intensity]); o.intensity = 0; } });
       for (const stage of [lm.userData.descent, lm.userData.ascent]) if (stage?.userData.plume) stage.userData.plume.visible = false;
       lm.traverse(o => { if (o.isMesh) { o.castShadow = true; o.receiveShadow = true; } });
@@ -668,8 +681,46 @@ export class LunarScene {
       g.position.set(best.x, this.groundAt(best.x, best.z) - .00003, best.z); // footpads pressed a few centimetres into the regolith
       const tilt = new THREE.Quaternion().setFromUnitVectors(Y_UP, best.n), face = new THREE.Quaternion().setFromAxisAngle(Y_UP, Math.atan2(-best.x, -best.z) + Math.PI);
       g.quaternion.copy(tilt).multiply(face); g.userData.at = { x: best.x, z: best.z };
-      this.localGroup.add(g); this.applyView(); if (this.result) this.applyLights(); this.checkHere(true); this.invalidate();
+      // The relief's shadow on the lander too (TerrainLight), before its shaders are compiled: it is part of their key.
+      g.traverse(o => { if (o.isMesh) for (const m of Array.isArray(o.material) ? o.material : [o.material]) this.groundLight.attach(m); }); g.userData.terrainLight = true;
+      this.localGroup.add(g); this.warmSurface(); this.applyView(); if (this.result) this.applyLights(); this.checkHere(true); this.invalidate();
     });
+  }
+  // The surface view made ready ahead: a few seconds after a site's relief is up, its detailed ground, the lander
+  // and its cabin are built (hidden) while the page is idle, so the first switch to the surface finds them ready.
+  prepareSurface() {
+    clearTimeout(this.prepareTimer);
+    if (navigator.connection?.saveData) return;
+    this.prepareTimer = setTimeout(() => this.whenQuiet().then(() => { if (!this.disposed && this.terrain) this.ensureGround(); }), 3500);
+  }
+  // Resolves once the page is idle and nobody has touched it for 2 s (at once on the surface, where it is awaited): the background work still holds the page for
+  // moments (a few shaders compile on the main thread), never in the middle of a drag.
+  whenQuiet() {
+    if (!this.onInput) { this.lastInput = 0; this.onInput = () => { this.lastInput = performance.now(); }; for (const e of ['pointerdown', 'pointermove', 'wheel', 'keydown', 'touchstart']) window.addEventListener(e, this.onInput, { passive: true }); }
+    return new Promise(resolve => {
+      const check = () => { if (this.disposed) return; if (this.view === 'surface') { resolve(); return; } const wait = 2000 - (performance.now() - this.lastInput); if (wait > 0) setTimeout(check, wait + 50); else if (window.requestIdleCallback) requestIdleCallback(() => (performance.now() - this.lastInput < 2000 ? check() : resolve()), { timeout: 3000 }); else resolve(); };
+      check();
+    });
+  }
+  // Every shader the surface view draws (ground, lander, walker), with the cabin's lamps off and on (the light count
+  // is part of every lit shader), compiled in parallel off the page's thread (KHR_parallel_shader_compile) into the
+  // target the scene is drawn to; they appear once it is done. Drawn straight away instead, each new shader's first
+  // draw waited for its compile, freezing the page for seconds on Windows (ANGLE).
+  warmSurface() {
+    const r = this.renderer, landing = this.landing, lander = this.lander, cabin = this.cabin?.group, previous = r.getRenderTarget(), jobs = [];
+    const compile = () => { try { jobs.push(r.compileAsync(this.scene, this.camera)); } catch { /* compiled on first use instead */ } };
+    try {
+      r.setRenderTarget(this.sky?.composer?.readBuffer || null); compile();
+      if (cabin && lander) { const was = [lander.visible, cabin.visible]; lander.visible = cabin.visible = true; try { compile(); } finally { [lander.visible, cabin.visible] = was; } }
+    } finally { r.setRenderTarget(previous); }
+    const done = () => {
+      if (this.disposed || this.landing !== landing) return;
+      this.surfaceReady = true; this.cabinWarm = true; this.applyView();
+      if (this.view === 'surface') { this.placeWalker(true); this.checkHere(true); }
+      this.invalidate();
+    };
+    // Never left waiting: a context that never reports completion still shows the surface (compiled on first draw).
+    Promise.race([Promise.all(jobs), new Promise(resolve => setTimeout(resolve, 15000))]).then(done, done);
   }
   // Ground normal from the heights 2 m around a point.
   groundNormal(x, z) {
@@ -715,7 +766,7 @@ export class LunarScene {
   // stage hides; the cabin's walls, its floodlights and the sunlight through the windows take over. Drag looks around.
   // 'Leave the lander' puts the walker at the foot of the ladder, facing the lunar module.
   setCabin(on, reset = true, animate = true, fromBlack = false) {
-    const w = this.walker; if (on && (!this.cabin || !this.lander || this.view !== 'surface')) return;
+    const w = this.walker; if (on && (!this.cabin || !this.lander || this.view !== 'surface' || !this.surfaceReady)) return;
     if (on && !this.cabinWarm && animate && !reducedMotion()) {
       // The first time in, the cabin's shaders take 1–2 s to build on integrated GPUs: the picture dips to black at
       // once (the click is answered), they build behind it, and the walk-in starts out of the black.
@@ -896,12 +947,12 @@ export class LunarScene {
     el.innerHTML = `<div class="helmet-glare"></div><div class="helmet-ghost"></div>
       <svg class="helmet-frame" viewBox="0 0 1000 600" preserveAspectRatio="none">
         <defs>
-          <filter id="helmetBlur" x="-30%" y="-30%" width="160%" height="160%"><feGaussianBlur stdDeviation="14"/></filter>
+          <filter id="helmetBlur" x="-10%" y="-10%" width="120%" height="120%"><feGaussianBlur stdDeviation="14"/></filter>
           <filter id="helmetSoft" x="-20%" y="-20%" width="140%" height="140%"><feGaussianBlur stdDeviation="3.5"/></filter>
-          <radialGradient id="helmetShell" cx="50%" cy="44%" r="70%"><stop offset="70%" stop-color="#303236"/><stop offset="86%" stop-color="#17181b"/><stop offset="100%" stop-color="#08090a"/></radialGradient>
+          <radialGradient id="helmetShell" gradientUnits="userSpaceOnUse" cx="0" cy="0" r="1" gradientTransform="translate(500 253) scale(826 546)"><stop offset="70%" stop-color="#303236"/><stop offset="86%" stop-color="#17181b"/><stop offset="100%" stop-color="#08090a"/></radialGradient>
           <linearGradient id="helmetChest" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#3a3b3e"/><stop offset=".5" stop-color="#1c1d20"/><stop offset="1" stop-color="#0c0c0e"/></linearGradient>
         </defs>
-        <path filter="url(#helmetBlur)" fill="url(#helmetShell)" fill-rule="evenodd" d="M-90 -90 H1090 V690 H-90 Z M500 10 C806 10 972 34 986 180 C998 320 984 452 914 540 C836 628 164 628 86 540 C16 452 2 320 14 180 C28 34 194 10 500 10 Z"/>
+        <path filter="url(#helmetBlur)" fill="url(#helmetShell)" fill-rule="evenodd" d="M-360 -320 H1360 V840 H-360 Z M500 10 C806 10 972 34 986 180 C998 320 984 452 914 540 C836 628 164 628 86 540 C16 452 2 320 14 180 C28 34 194 10 500 10 Z"/>
         <ellipse filter="url(#helmetBlur)" cx="500" cy="716" rx="470" ry="182" fill="url(#helmetChest)"/>
         <path filter="url(#helmetSoft)" fill="none" stroke="rgba(255,255,255,.08)" stroke-width="4" d="M120 560 C300 520 700 520 880 560"/>
         <path filter="url(#helmetSoft)" fill="none" stroke="rgba(255,255,255,.10)" stroke-width="5" stroke-linecap="round" d="M96 128 C170 56 320 26 452 22"/>
@@ -970,15 +1021,28 @@ export class LunarScene {
   // The helmet and the controls cover the part of the scene left free by the panels; the Sun's glare sits where
   // the Sun is, and grows as it nears the line of sight (none when the relief or the Earth hides it).
   placeWalkOverlay() {
-    if (this.view !== 'surface') return;
+    if (this.view !== 'surface') { this.hudBox = null; return; }
+    // The visor fills the free area at close to its own shape, and the shell runs on, darkening, under the panels:
+    // stretched over a short screen's free area it became a flat grey band, with the bare scene beside it.
     const { w, h, fw, fh } = this.free || this.freeArea();
-    Object.assign(this.helmet.style, { width: `${fw}px`, height: `${fh}px` });
+    const ar = Math.min(2, Math.max(.85, fw / fh)), vw = Math.min(fw, fh * ar), vh = vw / ar, frame = this.helmet.querySelector('.helmet-frame').style;
+    const key = `${Math.round((fw - vw) / 2)},${Math.round((fh - vh) / 2)},${Math.round(vw)},${Math.round(vh)}`;
+    if (this.helmetKey !== key) { this.helmetKey = key; const [left, top, width, height] = key.split(',').map(v => `${v}px`); Object.assign(frame, { left, top, width, height }); }
     const hud = this.walkHud, hw = hud.offsetWidth || 320, hh = hud.offsetHeight || 120;
-    // At the bottom of the free area, or above the scene's tool row where they would meet (narrow screens).
+    // At the bottom of the free area, centred. Where it would meet the scene's tool row: beside it when there is room
+    // (short laptop screens, so it does not climb over the view tabs), otherwise above it.
     let hx = Math.max(12, Math.min(fw - hw - 12, fw / 2 - hw / 2)), hy = Math.max(12, fh - hh - 10);
     const tools = document.querySelector('.stage-tools')?.getBoundingClientRect(), box = this.container.getBoundingClientRect();
-    if (tools?.width) { const tl = tools.left - box.left, tr = tools.right - box.left, tt = tools.top - box.top; if (hx < tr + 8 && hx + hw > tl - 8 && hy + hh > tt - 8) hy = Math.max(12, tt - hh - 10); }
-    hud.style.transform = `translate(${hx}px,${hy}px)`;
+    // A short free area (laptop screens): up in the corner beside the title, over the empty sky, so the horizon and
+    // the ground in the middle of the visor stay clear.
+    const title = document.querySelector('.stage-title')?.getBoundingClientRect();
+    if (fh < 460 && title?.width && fw - hw - 12 >= title.right - box.left + 16) { hx = fw - hw - 12; hy = 12; } else if (tools?.width) {
+      const tl = tools.left - box.left, tr = tools.right - box.left, tt = tools.top - box.top, tb = tools.bottom - box.top;
+      if (hx < tr + 8 && hx + hw > tl - 8 && hy + hh > tt - 8) {
+        if (tr + 16 + hw <= fw - 12) { hx = Math.max(hx, tr + 16); hy = Math.max(12, tb - hh); } else hy = Math.max(12, tt - hh - 10);
+      }
+    }
+    hud.style.transform = `translate(${hx}px,${hy}px)`; this.hudBox = hud.hidden ? null : [hx, hy, hw, hh];
     const glare = this.helmet.firstElementChild, ghost = glare.nextElementSibling, here = this.walker.here;
     if (!this.result || !this.walker.helmet) { glare.style.opacity = ghost.style.opacity = '0'; return; }
     const sun = v3(this.result.sun.direction), look = this.controls.target.clone().sub(this.camera.position).normalize();
@@ -991,8 +1055,8 @@ export class LunarScene {
   invalidate() { this.dirty = true; }
   dispose() {
     this.disposed = true; cancelAnimationFrame(this.frame); this.resizeObserver.disconnect(); this.controls.dispose(); this.sky.dispose(); this.groundLight.dispose(); this.renderer.dispose();
-    window.removeEventListener('keydown', this.onWalkKey); window.removeEventListener('keyup', this.onWalkKey); window.removeEventListener('blur', this.onWalkBlur);
-    this.landing?.dispose(); this.landerMaterials?.dispose(); this.landerEnv?.dispose(); this.helmet.remove(); this.fade.remove(); this.walkHud.remove();
+    window.removeEventListener('keydown', this.onWalkKey); clearTimeout(this.prepareTimer); if (this.onInput) for (const e of ['pointerdown', 'pointermove', 'wheel', 'keydown', 'touchstart']) window.removeEventListener(e, this.onInput); window.removeEventListener('keyup', this.onWalkKey); window.removeEventListener('blur', this.onWalkBlur);
+    this.landing?.dispose(); this.landerMaterials?.dispose(); this.landerEnv?.dispose(); this.cabinEnv?.dispose(); this.helmet.remove(); this.fade.remove(); this.walkHud.remove();
     [...this.siteLabels, ...this.blockLabels, ...this.sitePins.map(p => p.el)].forEach(el => el.remove());
   }
 }

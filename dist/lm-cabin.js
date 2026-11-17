@@ -130,9 +130,11 @@ function cabinAmbient() {
   const t = new THREE.CubeTexture(faces); t.colorSpace = THREE.SRGBColorSpace; t.needsUpdate = true; return t;
 }
 
-export function buildLMCabin({ exterior = null, worldScale = 1, lights = true } = {}) {
+// ambient: a ready PMREM texture to use instead of the cube below (the caller owns it): the cube is converted on its
+// first draw, compiling PMREM's shaders for its 4 px size there and then (a stall of seconds on Windows).
+export function buildLMCabin({ exterior = null, worldScale = 1, lights = true, ambient: given = null } = {}) {
   const group = new THREE.Group(); group.name = 'LM crew cabin';
-  const texture = makeAtlas(), skin = makeSkin(), floorMap = makeFloor(), ambient = cabinAmbient(), materials = [], geometries = [], buckets = new Map(), instances = new Map();
+  const texture = makeAtlas(), skin = makeSkin(), floorMap = makeFloor(), ambient = given || cabinAmbient(), materials = [], geometries = [], buckets = new Map(), instances = new Map();
   const mat = (color, roughness = .72, metalness = .1, extra = {}) => { const m = new THREE.MeshStandardMaterial({ color, roughness, metalness, ...extra }); materials.push(m); return m; };
   const wall = boxMapped(mat(0xffffff, .78, .12), skin, .9), trim = mat(0x242b29, .6, .25), metal = mat(0xa8aaa1, .43, .6), black = mat(0x131917), white = mat(0xc9c9b5), red = mat(0x923728), fabric = mat(0xd9d3c4, .97, 0);
   const floor = boxMapped(mat(0xffffff, .9, .05), floorMap, .55), beta = mat(0xe6e0d0, .96, 0), hose = mat(0x2b4f8c, .6, 0), hoseRed = mat(0x8c2b2b, .6, 0), cableW = mat(0xb8b4a6, .7, 0);
@@ -357,5 +359,5 @@ export function buildLMCabin({ exterior = null, worldScale = 1, lights = true } 
   const eyes = { cdr: V(.62, 4.84, .84), lmp: V(-.54, 4.84, .84) }, lookDir = V(0, -.30, 1).normalize();
   group.userData.frame = { units: 'metres', forward: '+Z', up: '+Y', cdrSide: '+X', eyeHeight: 4.87 };
   group.userData.windowCorners = windowCorners;
-  return { group, eyes, lookDir, hideForInterior, setInterior, dispose() { setInterior(false); group.removeFromParent(); geometries.forEach(g => g.dispose()); materials.forEach(m => m.dispose()); texture.dispose(); skin.dispose(); floorMap.dispose(); ambient.dispose(); } };
+  return { group, eyes, lookDir, hideForInterior, setInterior, dispose() { setInterior(false); group.removeFromParent(); geometries.forEach(g => g.dispose()); materials.forEach(m => m.dispose()); texture.dispose(); skin.dispose(); floorMap.dispose(); if (!given) ambient.dispose(); } };
 }

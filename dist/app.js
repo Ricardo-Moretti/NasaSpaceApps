@@ -384,7 +384,9 @@ function setFold(name, open) {
   const label = t(open ? 'fold.hide' : 'fold.show', { name: name === 'chart' ? t('fold.chart') : name === 'console' ? t('fold.console') : t(name) }); button.setAttribute('aria-label', label); button.title = label;
 }
 let folds = {}; try { folds = JSON.parse(localStorage.getItem(FOLDS)) || {}; } catch { /* storage optional */ }
-$$('[data-fold]').forEach(b => { setFold(b.dataset.fold, folds[b.dataset.fold] !== false); b.addEventListener('click', () => { const open = b.getAttribute('aria-expanded') !== 'true'; setFold(b.dataset.fold, open); folds[b.dataset.fold] = open; try { localStorage.setItem(FOLDS, JSON.stringify(folds)); } catch { /* storage optional */ } }); });
+// On a short desktop window the console starts with its date and site row folded (until the visitor chooses).
+const shortScreen = matchMedia('(min-width: 1181px) and (max-height: 860px)').matches;
+$$('[data-fold]').forEach(b => { const name = b.dataset.fold; setFold(name, name in folds ? folds[name] !== false : !(name === 'console' && shortScreen)); b.addEventListener('click', () => { const open = b.getAttribute('aria-expanded') !== 'true'; setFold(b.dataset.fold, open); folds[b.dataset.fold] = open; try { localStorage.setItem(FOLDS, JSON.stringify(folds)); } catch { /* storage optional */ } }); });
 $$('[name=panel]').forEach(el => el.addEventListener('change', () => { state.panel = el.value; render(); }));
 $$('[data-view]').forEach(b => b.addEventListener('click', () => setView(b.dataset.view)));
 $('#hourSlider').addEventListener('input', () => { cancelRitual(); stopPlayback(); const date = new Date(state.date); date.setUTCHours(0, Number($('#hourSlider').value), 0, 0); setDate(date); });
