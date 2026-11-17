@@ -136,13 +136,25 @@ export class TerrainLight {
   }
   setTerrain(terrain) {
     const n = this.lowPower ? TERRAIN_LIGHT.lowHeightSize : TERRAIN_LIGHT.heightSize, h = (x, z) => terrain.heightAt(x, z);
-    this.replaceGrid(0, 0);
+    if (this.landingGrid && this.grids[0] !== this.landingGrid) { this.landingGrid.height.dispose(); this.landingGrid.target.dispose(); }
+    this.landingGrid = null; this.landingOn = true; this.replaceGrid(0, 0);
     this.replaceGrid(1, terrain.inner ? terrain.inner.extent / 2 : 0, n, h);
     this.replaceGrid(2, terrain.extent / 2, n, h);
     this.replaceGrid(3, (terrain.wide?.extent || terrain.extent) / 2, n, h);
   }
   setLanding(landing) {
+    if (this.landingGrid && this.grids[0] !== this.landingGrid) { this.landingGrid.height.dispose(); this.landingGrid.target.dispose(); }
     this.replaceGrid(0, landing?.half || 0, this.lowPower ? 256 : TERRAIN_LIGHT.landingHeightSize, (x, z) => landing.heightAt(x, z));
+    this.landingGrid = this.grids[0]; this.landingOn = true;
+  }
+  // The landing grid only while the surface view shows that ground: in the relief view it only added a bake per Sun
+  // step and a longer march to every other bake (playback slowed enough on a laptop to drop the resolution).
+  useLanding(on) {
+    const g = this.landingGrid; if (!g || this.landingOn === on) return; this.landingOn = on;
+    this.grids[0] = on ? g : null; this.uniforms.terrainHalves.value.setComponent(0, on ? g.half : 0);
+    this.uniforms.terrainVisibility0.value = on ? g.target.texture : this.fallback; this.bake.uniforms.height0.value = on ? g.height : this.zero;
+    this.bake.uniforms.topKm.value = Math.max(-1e3, ...this.grids.filter(Boolean).map(x => x.height.userData.top));
+    this.dirty = this.force = true;
   }
   setSun(direction) {
     const d = direction.clone().normalize();
@@ -202,7 +214,7 @@ terrainPosition=(modelMatrix*terrainWorld).xz;`);
     return true;
   }
   dispose() {
-    for (const grid of this.grids) if (grid) { grid.height.dispose(); grid.target.dispose(); }
+    for (const grid of new Set([...this.grids, this.landingGrid])) if (grid) { grid.height.dispose(); grid.target.dispose(); }
     this.fallback.dispose(); this.zero.dispose(); this.quad.geometry.dispose(); this.bake.dispose();
   }
 }

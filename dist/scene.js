@@ -471,6 +471,7 @@ export class LunarScene {
     const ready = surface && Boolean(this.landing) && this.surfaceReady;
     this.walkHud.hidden = !surface; this.astronaut.visible = ready && !this.walker.cabin;
     if (this.landing) this.landing.group.visible = ready;
+    this.groundLight.useLanding(ready);
     if (this.lander) this.lander.visible = ready && (this.walker.lander || this.walker.cabin);
     if (this.innerMesh) { const g = ready && this.innerHoled || this.innerFull; if (g && this.innerMesh.geometry !== g) this.innerMesh.geometry = g; }
     const preparing = surface && !ready;
@@ -508,10 +509,13 @@ export class LunarScene {
       const flat = new THREE.Vector3(direction[0], 0.06, direction[2]).normalize();
       this.camera.position.copy(this.controls.target).sub(flat.multiplyScalar(0.00008));
     } else {
-      // Behind the observer, slightly off the sunline: grazing light reads the relief best.
+      // Behind the observer, slightly off the sunline: grazing light reads the relief best. The Sun to the right of the
+      // observer, clear of the title and its chips at the top left.
       this.camera.fov = 42;
       const d = this.result?.sun.direction || [0.7, 0.02, 0.7];
-      const toward = new THREE.Vector3(d[0], 0, d[2]).normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), -0.32);
+      // Less off the sunline on a narrow frame (a phone held upright), where 0.32 rad put the Sun past the edge.
+      const { fw, fh } = this.freeArea(), off = 0.32 * Math.min(1, fw / fh / 1.4);
+      const toward = new THREE.Vector3(d[0], 0, d[2]).normalize().applyAxisAngle(new THREE.Vector3(0, 1, 0), off);
       this.controls.target.set(toward.x * 6, 0, toward.z * 6);
       this.camera.position.set(-toward.x * 38, 9.5, -toward.z * 38);
     }
@@ -562,7 +566,17 @@ export class LunarScene {
 
   project(position) {
     const p = position.clone().project(this.camera), w = this.container.clientWidth, h = this.container.clientHeight;
-    return { x: (p.x * 0.5 + 0.5) * w, y: (-p.y * 0.5 + 0.5) * h, visible: p.z < 1 && p.z > -1 && Math.abs(p.x) < 0.96 && Math.abs(p.y) < 0.92 };
+    return { x: (p.x * 0.5 + 0.5) * w, y: (-p.y * 0.5 + 0.5) * h, w, h, visible: p.z < 1 && p.z > -1 && Math.abs(p.x) < 0.96 && Math.abs(p.y) < 0.92 };
+  }
+  // The interface over the scene, in scene coordinates (measured again at most every 0.4 s): what labels keep clear of.
+  uiRects() {
+    const now = performance.now(); if (this.uiCache && now - this.uiCache.t < 400) return this.uiCache.rects;
+    const box = this.container.getBoundingClientRect(), rects = [];
+    for (const e of document.querySelectorAll('#primarySiteName, .stage-sub > span, .view-tabs, .stage-controls > *, .stage-meta > span, .stage-tools, .answer, .console')) {
+      const b = e.getBoundingClientRect(); if (b.width && b.height && e.textContent !== '' || e.matches('.stage-tools, .answer, .console') && b.width) rects.push([b.left - box.left, b.top - box.top, b.width, b.height]);
+    }
+    if (this.hudBox) rects.push(this.hudBox);
+    this.uiCache = { t: now, rects }; return rects;
   }
   updateLabels() {
     const local = this.view !== 'globe', away = this.view === 'surface' && (Math.hypot(this.walker.x, this.walker.z) >= .001 || this.walker.cabin);
@@ -571,10 +585,12 @@ export class LunarScene {
       const label = document.getElementById(`${body}Label`); if (!label) continue;
       // Their numbers belong to the reference point: away from it, the walk panel says what is in view.
       if (!local || !this.result || this.telephoto || away) { label.style.opacity = '0'; continue; }
-      // Hidden where it would slip under the walk controls (half a label peeking out beside them).
-      const p = this.project(this[body].position), x = p.x + 14, y = p.y - 14, hb = this.hudBox;
-      const under = hb && x < hb[0] + hb[2] && x + (label.offsetWidth || 160) > hb[0] && y < hb[1] + hb[3] && y + 28 > hb[1];
-      label.style.opacity = p.visible && !under ? '1' : '0'; label.style.transform = `translate(${x}px,${y}px)`;
+      // Beside its body, on the first side clear of the interface (title chips, panels, walk controls); hidden when every
+      // side is covered, rather than half a label peeking out from under a panel.
+      const p = this.project(this[body].position), lw = label.offsetWidth || 160, lh = label.offsetHeight || 28, ui = this.uiRects();
+      const clear = ([x, y]) => x >= 4 && y >= 4 && x + lw <= p.w - 4 && !ui.some(r => x < r[0] + r[2] + 6 && x + lw > r[0] - 6 && y < r[1] + r[3] + 6 && y + lh > r[1] - 6);
+      const spot = [[p.x + 14, p.y - lh / 2], [p.x - 14 - lw, p.y - lh / 2], [p.x + 10, p.y + 12], [p.x + 10, p.y - 12 - lh], [p.x - 10 - lw, p.y + 12], [p.x - 10 - lw, p.y - 12 - lh]].find(clear);
+      label.style.opacity = p.visible && spot ? '1' : '0'; if (spot) label.style.transform = `translate(${Math.round(spot[0])}px,${Math.round(spot[1])}px)`;
     }
     ['sun', 'earth'].forEach((body, i) => {
       const el = this.blockLabels[i], state = this.rays[body].state;
@@ -625,7 +641,14 @@ export class LunarScene {
   // ahead, falls in the middle of the free area; the canvas shows the part of that frame it covers.
   frameView() {
     const cam = this.camera;
-    if (this.view !== 'surface') { if (cam.view?.enabled) { cam.clearViewOffset(); const { width, height } = this.container.getBoundingClientRect(); if (width && height) { cam.aspect = width / height; cam.updateProjectionMatrix(); } } return; }
+    if (this.view === 'globe') { if (cam.view?.enabled) { cam.clearViewOffset(); const { width, height } = this.container.getBoundingClientRect(); if (width && height) { cam.aspect = width / height; cam.updateProjectionMatrix(); } } return; }
+    if (this.view === 'terrain') {
+      // The relief: the whole composition framed in the free area (the canvas shows on past it, under the panels), as on a
+      // large screen. Framed on the whole canvas, on a laptop screen the rays ran under the panels, the Sun under the chips.
+      const { w, h, fw, fh } = this.free = this.freeArea();
+      if (cam.view?.enabled && cam.view.fullWidth === fw && cam.view.fullHeight === fh && cam.view.width === w && cam.view.height === h) return;
+      cam.aspect = fw / fh; cam.setViewOffset(fw, fh, 0, 0, w, h); return;
+    }
     const { w, h, fw, fh } = this.free = this.freeArea(), dx = Math.max(0, (w - fw) / 2), dy = Math.max(0, (h - fh) / 2), FW = w + 2 * dx, FH = h + 2 * dy;
     if (cam.view?.enabled && cam.view.fullWidth === FW && cam.view.fullHeight === FH) return;
     cam.aspect = FW / FH; cam.setViewOffset(FW, FH, 2 * dx, 2 * dy, w, h);
